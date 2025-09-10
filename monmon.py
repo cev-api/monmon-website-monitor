@@ -68,6 +68,9 @@ class Monitor:
     use_js: bool = False
     js_wait_ms: int = 3000
     js_wait_selector: Optional[str] = None
+    # Track last HTTP status and whether we're in a continuous error state
+    last_status_code: Optional[int] = None
+    last_status_is_error: bool = False
 
 @dataclass
 class AppState:
@@ -333,8 +336,43 @@ class MonitorWorker(threading.Thread):
                     ts_footer = time.strftime("%Y-%m-%d %H:%M:%S")
                     msg = f"[WARN] {self.monitor.url} responded {status_code}"
                     self.alert_queue.put(f"{YELLOW}{msg}{RESET}")
-                    send_discord(self.state.webhook_url, "Website Access Error", self.monitor.url, self.monitor.selector, self.monitor.mode, msg, footer_text=f"Detected at {ts_footer}")
+                    # Send webhook only once per continuous error/status code
+                    if (not self.monitor.last_status_is_error) or (self.monitor.last_status_code != status_code):
+                        send_discord(
+                            self.state.webhook_url,
+                            "Website Access Error",
+                            self.monitor.url,
+                            self.monitor.selector,
+                            self.monitor.mode,
+                            msg,
+                            footer_text=f"Detected at {ts_footer}"
+                        )
+                        self.monitor.last_status_is_error = True
+                        self.monitor.last_status_code = status_code
+                        save_state(self.state)
+                    else:
+                        # Still down with same code; suppress duplicate webhook
+                        self.monitor.last_status_code = status_code
                 else:
+                    # If recovering from an error, send a single recovery alert
+                    if self.monitor.last_status_is_error:
+                        ts_footer = time.strftime("%Y-%m-%d %H:%M:%S")
+                        rec_msg = f"[RECOVERY] {self.monitor.url} responded {status_code}"
+                        self.alert_queue.put(f"{GREEN}{rec_msg}{RESET}")
+                        send_discord(
+                            self.state.webhook_url,
+                            "Website Recovered",
+                            self.monitor.url,
+                            self.monitor.selector,
+                            self.monitor.mode,
+                            rec_msg,
+                            footer_text=f"Recovered at {ts_footer}"
+                        )
+                        self.monitor.last_status_is_error = False
+                        self.monitor.last_status_code = status_code
+                        save_state(self.state)
+                    else:
+                        self.monitor.last_status_code = status_code
                     if content is None:
                         if self.state.verbose_status:
                             ts = time.strftime("%H:%M:%S")
@@ -392,7 +430,20 @@ class MonitorWorker(threading.Thread):
                 ts_footer = time.strftime("%Y-%m-%d %H:%M:%S")
                 msg = f"[ERROR] {self.monitor.url}: {e}"
                 self.alert_queue.put(f"{YELLOW}{msg}{RESET}")
-                send_discord(self.state.webhook_url, "Website Access Error", self.monitor.url, self.monitor.selector, self.monitor.mode, msg, footer_text=f"Detected at {ts_footer}")
+                code = -1  # synthetic code for exceptions
+                if (not self.monitor.last_status_is_error) or (self.monitor.last_status_code != code):
+                    send_discord(
+                        self.state.webhook_url,
+                        "Website Access Error",
+                        self.monitor.url,
+                        self.monitor.selector,
+                        self.monitor.mode,
+                        msg,
+                        footer_text=f"Detected at {ts_footer}"
+                    )
+                    self.monitor.last_status_is_error = True
+                    self.monitor.last_status_code = code
+                    save_state(self.state)
 
             first_run = False
             elapsed = time.time() - start_ts
