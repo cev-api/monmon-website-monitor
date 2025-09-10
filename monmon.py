@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 
+
 import os
 import sys
 import json
@@ -15,6 +16,34 @@ from sys import stdout
 import requests
 from bs4 import BeautifulSoup
 
+# Optional Rich UI
+try:
+    from rich.console import Console
+    from rich.panel import Panel
+    from rich.table import Table
+    from rich import box
+    from rich.prompt import Prompt
+    from rich.text import Text
+    _rich_available = True
+    _console = Console()
+except Exception:
+    _rich_available = False
+    _console = None
+
+# UI width helper (keep things compact)
+def _ui_width() -> int:
+    try:
+        if _rich_available and _console is not None:
+            w = getattr(_console, "width", None)
+            if not w:
+                size = getattr(_console, "size", None)
+                w = getattr(size, "width", 80) if size else 80
+            # Cap for compact UI; ensure sensible min
+            return max(60, min(96, int(w) - 2))
+    except Exception:
+        pass
+    return 80
+
 try:
     import importlib
     _playwright_available = importlib.util.find_spec("playwright") is not None
@@ -25,16 +54,16 @@ APP_STATE_FILE = "monitor_state.json"
 DEFAULT_USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win32; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/127.0.0.0 Safari/537.36"
 
 # ========================
-# Terminal color theme
+# Terminal color theme 
 # ========================
 
 RED   = "\033[91m"
 YELLOW= "\033[93m"
 GREEN = "\033[92m"                 
-PURPLE  = "\033[38;2;150;82;214m"   # royal purple (headers/info)
+CYAN  = "\033[38;2;150;82;214m"   # royal purple (headers/info)
 RESET = "\033[0m"
 
-# ### ADDED ### common real-browsers UA presets
+# common real-browsers UA presets
 PRESET_USER_AGENTS: Dict[str, str] = {
     "Windows 11 · Chrome 127 (Default)": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/127.0.0.0 Safari/537.36",
     "Windows 11 · Firefox 128": "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:128.0) Gecko/20100101 Firefox/128.0",
@@ -68,9 +97,6 @@ class Monitor:
     use_js: bool = False
     js_wait_ms: int = 3000
     js_wait_selector: Optional[str] = None
-    # Track last HTTP status and whether we're in a continuous error state
-    last_status_code: Optional[int] = None
-    last_status_is_error: bool = False
 
 @dataclass
 class AppState:
@@ -242,7 +268,7 @@ def colorize_diff(diff_text: str) -> str:
     colored = []
     for ln in lines:
         if ln.startswith('+++') or ln.startswith('---') or ln.startswith('@@'):
-            colored.append(PURPLE + ln + RESET)
+            colored.append(CYAN + ln + RESET)
         elif ln.startswith('+') and not ln.startswith('+++'):
             colored.append(GREEN + ln + RESET)
         elif ln.startswith('-') and not ln.startswith('---'):
@@ -336,47 +362,12 @@ class MonitorWorker(threading.Thread):
                     ts_footer = time.strftime("%Y-%m-%d %H:%M:%S")
                     msg = f"[WARN] {self.monitor.url} responded {status_code}"
                     self.alert_queue.put(f"{YELLOW}{msg}{RESET}")
-                    # Send webhook only once per continuous error/status code
-                    if (not self.monitor.last_status_is_error) or (self.monitor.last_status_code != status_code):
-                        send_discord(
-                            self.state.webhook_url,
-                            "Website Access Error",
-                            self.monitor.url,
-                            self.monitor.selector,
-                            self.monitor.mode,
-                            msg,
-                            footer_text=f"Detected at {ts_footer}"
-                        )
-                        self.monitor.last_status_is_error = True
-                        self.monitor.last_status_code = status_code
-                        save_state(self.state)
-                    else:
-                        # Still down with same code; suppress duplicate webhook
-                        self.monitor.last_status_code = status_code
+                    send_discord(self.state.webhook_url, "Website Access Error", self.monitor.url, self.monitor.selector, self.monitor.mode, msg, footer_text=f"Detected at {ts_footer}")
                 else:
-                    # If recovering from an error, send a single recovery alert
-                    if self.monitor.last_status_is_error:
-                        ts_footer = time.strftime("%Y-%m-%d %H:%M:%S")
-                        rec_msg = f"[RECOVERY] {self.monitor.url} responded {status_code}"
-                        self.alert_queue.put(f"{GREEN}{rec_msg}{RESET}")
-                        send_discord(
-                            self.state.webhook_url,
-                            "Website Recovered",
-                            self.monitor.url,
-                            self.monitor.selector,
-                            self.monitor.mode,
-                            rec_msg,
-                            footer_text=f"Recovered at {ts_footer}"
-                        )
-                        self.monitor.last_status_is_error = False
-                        self.monitor.last_status_code = status_code
-                        save_state(self.state)
-                    else:
-                        self.monitor.last_status_code = status_code
                     if content is None:
                         if self.state.verbose_status:
                             ts = time.strftime("%H:%M:%S")
-                            self.alert_queue.put(f"{PURPLE}[{ts}] {self.monitor.url} — no change (304).{RESET}")
+                            self.alert_queue.put(f"{CYAN}[{ts}] {self.monitor.url} — no change (304).{RESET}")
                     else:
                         if self.monitor.selector and not content.strip():
                             ts = time.strftime("%H:%M:%S")
@@ -403,10 +394,10 @@ class MonitorWorker(threading.Thread):
                             self.monitor.last_modified = new_lm
                             save_state(self.state)
 
-                            # emit URL + diff as ONE clean block (no stray blank line)
+                            # ### MODIFIED ### emit URL + diff as ONE clean block (no stray blank line)
                             combined = (
                                 f"{RED}[CHANGE {ts_hms}] {self.monitor.url} — {self._selector_label()} changed! {RESET}\n"
-                                f"{PURPLE}{self.monitor.url}{RESET}\n"
+                                f"{CYAN}{self.monitor.url}{RESET}\n"
                                 f"{colorize_diff(d)}\n"  # ensure trailing newline for clean end
                             )
                             self.alert_queue.put(combined)
@@ -424,26 +415,13 @@ class MonitorWorker(threading.Thread):
                         else:
                             if self.state.verbose_status:
                                 ts = time.strftime("%H:%M:%S")
-                                self.alert_queue.put(f"{PURPLE}[{ts}] {self.monitor.url} — checked, no change.{RESET}")
+                                self.alert_queue.put(f"{CYAN}[{ts}] {self.monitor.url} — checked, no change.{RESET}")
 
             except Exception as e:
                 ts_footer = time.strftime("%Y-%m-%d %H:%M:%S")
                 msg = f"[ERROR] {self.monitor.url}: {e}"
                 self.alert_queue.put(f"{YELLOW}{msg}{RESET}")
-                code = -1  # synthetic code for exceptions
-                if (not self.monitor.last_status_is_error) or (self.monitor.last_status_code != code):
-                    send_discord(
-                        self.state.webhook_url,
-                        "Website Access Error",
-                        self.monitor.url,
-                        self.monitor.selector,
-                        self.monitor.mode,
-                        msg,
-                        footer_text=f"Detected at {ts_footer}"
-                    )
-                    self.monitor.last_status_is_error = True
-                    self.monitor.last_status_code = code
-                    save_state(self.state)
+                send_discord(self.state.webhook_url, "Website Access Error", self.monitor.url, self.monitor.selector, self.monitor.mode, msg, footer_text=f"Detected at {ts_footer}")
 
             first_run = False
             elapsed = time.time() - start_ts
@@ -489,7 +467,7 @@ def make_multi_gradient(stops, steps):
     return out
 
 def print_header() -> str:
-    sys.stdout.write("\x1b[8;{rows};{cols}t".format(rows=32, cols=130))
+    # Do not force terminal resize; respect user's window size
     banner = r"""
 ░▒▓██████████████▓▒░ ░▒▓██████▓▒░░▒▓███████▓▒░░▒▓██████████████▓▒░ ░▒▓██████▓▒░░▒▓███████▓▒░  
 ░▒▓█▓▒░░▒▓█▓▒░░▒▓█▓▒░▒▓█▓▒░░▒▓█▓▒░▒▓█▓▒░░▒▓█▓▒░▒▓█▓▒░░▒▓█▓▒░░▒▓█▓▒░▒▓█▓▒░░▒▓█▓▒░▒▓█▓▒░░▒▓█▓▒░ 
@@ -554,6 +532,12 @@ def preview_selection(url: str, selector: Optional[str], mode: str, use_js: bool
         return f"[ERROR] {e}"
 
 def add_monitor_flow(state: AppState) -> None:
+
+    try:
+        clear()
+        stdout.write(print_header())
+    except Exception:
+        pass
     url = input("Enter URL to monitor: ").strip()
     if not url:
         print(f"{YELLOW}URL is required.{RESET}")
@@ -586,7 +570,7 @@ def add_monitor_flow(state: AppState) -> None:
     # preview loop when a selector is provided
     if selector:
         while True:
-            print(f"{PURPLE}Previewing selector `{selector}` (mode={mode}, JS={use_js})...{RESET}")
+            print(f"{CYAN}Previewing selector `{selector}` (mode={mode}, JS={use_js})...{RESET}")
             prev = preview_selection(url, selector, mode, use_js, js_wait_ms, js_wait_selector)
             if prev.startswith("[ERROR]"):
                 print(f"{YELLOW}{prev}{RESET}")
@@ -625,10 +609,15 @@ def add_monitor_flow(state: AppState) -> None:
     save_state(state)
     print(f"{GREEN}Added monitor for {url} ({selector or 'whole page'}), every {interval}s.{RESET}")
     if use_js:
-        print(f"{PURPLE}JS-rendered mode enabled (wait {js_wait_ms} ms; wait_for: {js_wait_selector or 'None'}).{RESET}")
+        print(f"{CYAN}JS-rendered mode enabled (wait {js_wait_ms} ms; wait_for: {js_wait_selector or 'None'}).{RESET}")
 
 def remove_monitor_flow(state: AppState) -> None:
+    # Header will be printed by list_monitors below; but ensure banner if empty
     if not state.monitors:
+        try:
+            clear(); stdout.write(print_header())
+        except Exception:
+            pass
         print(f"{YELLOW}No monitors to remove.{RESET}")
         return
     list_monitors(state)
@@ -644,36 +633,390 @@ def remove_monitor_flow(state: AppState) -> None:
     except Exception:
         print(f"{YELLOW}Invalid index.{RESET}")
 
+def edit_monitor_flow(state: AppState, index: Optional[int] = None) -> None:
+    # Streamlined Rich-driven edit menu (with text fallback)
+    if not state.monitors:
+        try:
+            clear(); stdout.write(print_header())
+        except Exception:
+            pass
+        print(f"{YELLOW}No monitors to edit.{RESET}")
+        return
+
+    if index is None:
+        list_monitors(state)
+        idx = input("Enter index to edit: ").strip()
+        try:
+            i = int(idx)
+            if not (0 <= i < len(state.monitors)):
+                print(f"{YELLOW}Index out of range.{RESET}")
+                return
+        except Exception:
+            print(f"{YELLOW}Invalid index.{RESET}")
+            return
+    else:
+        i = index
+    m = state.monitors[i]
+
+    if _rich_available:
+        width = _ui_width()
+        while True:
+            try:
+                clear(); stdout.write(print_header())
+            except Exception:
+                pass
+
+            # Summary table with numeric field selectors
+            summary = Table(box=box.SIMPLE, show_edge=False, expand=False, padding=(0,1))
+            summary.width = width - 2
+            summary.add_column("Field", style="cyan", no_wrap=True)
+            summary.add_column("Value", overflow="fold", max_width=width-16)
+            summary.add_row("1 URL", m.url)
+            summary.add_row("2 Selector", m.selector or "(whole page)")
+            summary.add_row("3 Mode", m.mode)
+            summary.add_row("4 Every", f"{m.interval_sec}s")
+            summary.add_row("5 UA", (m.headers or {}).get("User-Agent", "(default)"))
+            summary.add_row("6 JS", "on" if m.use_js else "off")
+            summary.add_row("7 JS wait", f"{m.js_wait_ms} ms" if m.use_js else "-")
+            summary.add_row("8 wait_for", m.js_wait_selector or "(none)")
+
+            menu = Table.grid(padding=0)
+            menu.add_column()
+            menu.add_row("Enter 1-8 to edit a field   S) Save   R) Reset   P) Preview   Q) Cancel")
+            _console.print(Panel(summary, title=f"Edit Monitor #{i}", border_style="purple", width=width))
+            _console.print(Panel(menu, border_style="purple", width=width))
+            cmd = input("Choice: ").strip().lower()
+            if cmd == "1":
+                new_url = input("New URL (blank to keep): ").strip()
+                if new_url:
+                    m.url = new_url
+            elif cmd == "2":
+                new_sel = input("New CSS selector (blank for whole page): ").strip()
+                m.selector = new_sel if new_sel else None
+            elif cmd == "3":
+                m.mode = prompt_choice("Mode", ["text", "html"], m.mode)
+            elif cmd == "4":
+                try:
+                    s = input(f"Every seconds [{m.interval_sec}]: ").strip()
+                    if s and s.isdigit() and int(s) >= 1:
+                        m.interval_sec = int(s)
+                except Exception:
+                    pass
+            elif cmd == "5":
+                ua_in = input("Custom User-Agent (blank to clear/use default): ").strip()
+                if ua_in:
+                    m.headers = dict(m.headers or {})
+                    m.headers["User-Agent"] = ua_in
+                else:
+                    if m.headers and "User-Agent" in m.headers:
+                        m.headers.pop("User-Agent", None)
+                        if not m.headers:
+                            m.headers = {}
+            elif cmd == "6":
+                m.use_js = not m.use_js
+                if not m.use_js:
+                    m.js_wait_ms = 3000
+                    m.js_wait_selector = None
+            elif cmd == "7":
+                if m.use_js:
+                    m.js_wait_ms = prompt_int("JS wait ms", default=m.js_wait_ms, min_v=0, max_v=60000)
+            elif cmd == "8":
+                if m.use_js:
+                    tmp = input("wait_for selector (blank for none): ").strip()
+                    m.js_wait_selector = tmp if tmp else None
+            elif cmd == "p":
+                print(f"{CYAN}Previewing `{m.selector or '(whole page)'}` (mode={m.mode}, JS={m.use_js})...{RESET}")
+                prev = preview_selection(m.url, m.selector, m.mode, m.use_js, m.js_wait_ms, m.js_wait_selector)
+                if prev.startswith("[ERROR]"):
+                    print(f"{YELLOW}{prev}{RESET}")
+                else:
+                    if not prev.strip():
+                        print(f"{YELLOW}Selector matched NO content.{RESET}")
+                    else:
+                        print(f"{GREEN}--- Selector Preview Start ---{RESET}\n{prev}\n{GREEN}--- Selector Preview End ---{RESET}")
+                input("Press Enter to continue...")
+            elif cmd == "r":
+                m.last_hash = None; m.last_excerpt = None; m.etag = None; m.last_modified = None
+                print(f"{GREEN}Baseline reset. It will re-baseline on next check.{RESET}")
+                time.sleep(0.6)
+            elif cmd == "s":
+                save_state(state)
+                print(f"{GREEN}Monitor updated.{RESET}")
+                time.sleep(0.6)
+                return
+            elif cmd == "q":
+                print("Cancelled.")
+                time.sleep(0.4)
+                return
+            else:
+                print(f"{YELLOW}Unknown choice.{RESET}")
+                time.sleep(0.6)
+    else:
+        # Text fallback (simple prompts)
+        print(f"Editing monitor [{i}] — leave blank to keep current value")
+        print(f"Current URL: {m.url}")
+        new_url = input("New URL: ").strip()
+        if new_url:
+            m.url = new_url
+        print(f"Current selector: {m.selector or '(whole page)'}")
+        new_sel = input("New CSS selector (blank for whole page): ").strip()
+        if new_sel or new_sel == "":
+            m.selector = new_sel if new_sel else None
+        m.mode = prompt_choice("Compare 'text' or 'html'?", ["text", "html"], m.mode)
+        try:
+            new_interval = input(f"Check frequency in seconds [{m.interval_sec}]: ").strip()
+            if new_interval and new_interval.isdigit() and int(new_interval) >= 1:
+                m.interval_sec = int(new_interval)
+        except Exception:
+            pass
+        current_ua = m.headers.get("User-Agent", "") if m.headers else ""
+        print(f"Current custom User-Agent: {current_ua or '(none)'}")
+        ua_in = input("New custom User-Agent (blank to clear/keep none): ").strip()
+        if ua_in or ua_in == "":
+            if ua_in:
+                m.headers = dict(m.headers or {})
+                m.headers["User-Agent"] = ua_in
+            else:
+                if m.headers and "User-Agent" in m.headers:
+                    m.headers.pop("User-Agent", None)
+                    if not m.headers:
+                        m.headers = {}
+        m.use_js = prompt_choice("Use JS-rendered mode?", ["y", "n"], "y" if m.use_js else "n").lower() == "y"
+        if m.use_js:
+            m.js_wait_ms = prompt_int("Wait milliseconds after load (JS settle time)", default=m.js_wait_ms, min_v=0, max_v=60000)
+            print(f"Current wait_for selector: {m.js_wait_selector or '(none)'}")
+            tmp = input("New wait_for selector (blank for none): ").strip()
+            m.js_wait_selector = tmp if tmp else None
+        else:
+            m.js_wait_ms = 3000
+            m.js_wait_selector = None
+        reset_baseline = prompt_choice("Reset baseline (recommended after edits)?", ["y", "n"], "y")
+        if reset_baseline.lower() == "y":
+            m.last_hash = None
+            m.last_excerpt = None
+            m.etag = None
+            m.last_modified = None
+        save_state(state)
+        print(f"{GREEN}Monitor updated.{RESET}")
+
 def list_monitors(state: AppState) -> None:
+
+    try:
+        clear()
+        stdout.write(print_header())
+    except Exception:
+        pass
     if not state.monitors:
         print(f"{YELLOW}No monitors configured yet.{RESET}")
         return
-    for i, m in enumerate(state.monitors):
-        print(f"[{i}] {m.url}  | selector: {m.selector or '(whole page)'} | mode: {m.mode} | every {m.interval_sec}s | use_js={m.use_js}")
+    if _rich_available:
+        width = _ui_width()
+        table = Table(title="Configured Monitors", box=box.SIMPLE)
+        table.width = width
+        table.add_column("#", style="bold cyan", no_wrap=True)
+        table.add_column("URL", overflow="fold", max_width=max(20, width-34))
+        table.add_column("Sel", overflow="fold", max_width=12)
+        table.add_column("Mode", style="magenta", no_wrap=True)
+        table.add_column("Every", style="green", no_wrap=True)
+        table.add_column("JS", style="yellow", no_wrap=True)
+        for i, m in enumerate(state.monitors):
+            table.add_row(
+                str(i),
+                m.url,
+                (m.selector or "(page)")[:12],
+                m.mode,
+                f"{m.interval_sec}s",
+                "yes" if m.use_js else "no",
+            )
+        _console.print(Panel(table, border_style="purple", width=width))
+    else:
+        for i, m in enumerate(state.monitors):
+            print(f"[{i}] {m.url}  | selector: {m.selector or '(whole page)'} | mode: {m.mode} | every {m.interval_sec}s | use_js={m.use_js}")
+
+
+def manage_monitors_flow(state: AppState) -> None:
+    # Integrated Add/Edit/Remove/List view
+    while True:
+        try:
+            clear(); stdout.write(print_header())
+        except Exception:
+            pass
+
+        # Render list inline
+        if _rich_available:
+            width = _ui_width()
+            table = Table(title="Monitors", box=box.SIMPLE)
+            table.width = width
+            table.add_column("#", style="bold cyan", no_wrap=True)
+            table.add_column("URL", overflow="fold", max_width=max(20, width-34))
+            table.add_column("Sel", overflow="fold", max_width=12)
+            table.add_column("Mode", style="magenta", no_wrap=True)
+            table.add_column("Every", style="green", no_wrap=True)
+            table.add_column("JS", style="yellow", no_wrap=True)
+            for i, m in enumerate(state.monitors):
+                table.add_row(
+                    str(i), m.url, (m.selector or "(page)")[:12], m.mode, f"{m.interval_sec}s", "yes" if m.use_js else "no"
+                )
+            _console.print(Panel(table, border_style="purple", width=width))
+            actions = Table.grid(padding=0)
+            actions.add_column()
+            actions.add_row("A) Add   E) Edit   R) Remove   V) Preview   Q) Back")
+            _console.print(Panel(actions, border_style="purple", width=width))
+        else:
+            if not state.monitors:
+                print(f"{YELLOW}No monitors configured yet.{RESET}")
+            else:
+                for i, m in enumerate(state.monitors):
+                    print(f"[{i}] {m.url}  | selector: {m.selector or '(whole page)'} | mode: {m.mode} | every {m.interval_sec}s | use_js={m.use_js}")
+            print("\nA) Add   E) Edit   R) Remove   V) Preview   Q) Back")
+
+        cmd = input("Choice: ").strip().lower()
+        if cmd == "a":
+            add_monitor_flow(state)
+        elif cmd == "e":
+            if not state.monitors:
+                print(f"{YELLOW}No monitors to edit.{RESET}")
+                time.sleep(0.7)
+                continue
+            s = input("Index to edit: ").strip()
+            if not s.isdigit():
+                print(f"{YELLOW}Enter a valid index.{RESET}")
+                time.sleep(0.7)
+                continue
+            i = int(s)
+            if 0 <= i < len(state.monitors):
+                # edit flow will manage its own UI
+                edit_monitor_flow(state, i)
+            else:
+                print(f"{YELLOW}Index out of range.{RESET}")
+                time.sleep(0.7)
+        elif cmd == "r":
+            if not state.monitors:
+                print(f"{YELLOW}No monitors to remove.{RESET}")
+                time.sleep(0.7)
+                continue
+            s = input("Index to remove: ").strip()
+            try:
+                i = int(s)
+                if 0 <= i < len(state.monitors):
+                    removed = state.monitors.pop(i)
+                    save_state(state)
+                    print(f"{GREEN}Removed {removed.url} ({removed.selector or 'whole page'}).{RESET}")
+                    time.sleep(0.7)
+                else:
+                    print(f"{YELLOW}Index out of range.{RESET}")
+                    time.sleep(0.7)
+            except Exception:
+                print(f"{YELLOW}Invalid index.{RESET}")
+                time.sleep(0.7)
+        elif cmd == "v":
+            if not state.monitors:
+                print(f"{YELLOW}No monitors to preview.{RESET}")
+                time.sleep(0.7)
+                continue
+            s = input("Index to preview: ").strip()
+            if not s.isdigit():
+                print(f"{YELLOW}Enter a valid index.{RESET}")
+                time.sleep(0.7)
+                continue
+            i = int(s)
+            if not (0 <= i < len(state.monitors)):
+                print(f"{YELLOW}Index out of range.{RESET}")
+                time.sleep(0.7)
+                continue
+            m = state.monitors[i]
+            print(f"{CYAN}Previewing `{m.selector or '(whole page)'}` (mode={m.mode}, JS={m.use_js})...{RESET}")
+            prev = preview_selection(m.url, m.selector, m.mode, m.use_js, m.js_wait_ms, m.js_wait_selector)
+            if prev.startswith("[ERROR]"):
+                print(f"{YELLOW}{prev}{RESET}")
+            else:
+                if not prev.strip():
+                    print(f"{YELLOW}Selector matched NO content.{RESET}")
+                else:
+                    print(f"{GREEN}--- Selector Preview Start ---{RESET}\n{prev}\n{GREEN}--- Selector Preview End ---{RESET}")
+            input("Press Enter to continue...")
+        elif cmd == "q":
+            return
+        else:
+            print(f"{YELLOW}Unknown choice.{RESET}")
+            time.sleep(0.7)
 
 def set_webhook_flow(state: AppState) -> None:
+
+    try:
+        clear()
+        stdout.write(print_header())
+    except Exception:
+        pass
     current = state.webhook_url or "(not set)"
-    print(f"{PURPLE}Current Discord webhook: {current}{RESET}")
-    new_url = input("Enter Discord webhook URL (or blank to keep): ").strip()
+    if _rich_available:
+        width = _ui_width()
+        table = Table(box=box.SIMPLE, show_edge=False)
+        table.width = width - 2
+        table.add_column("Field", style="cyan", no_wrap=True)
+        table.add_column("Value")
+        table.add_row("Current", current)
+        instructions = "Paste your Discord webhook URL to update, or leave blank to keep the current value."
+        _console.print(Panel(table, title="Discord Webhook", border_style="purple", width=width))
+        _console.print(Panel(instructions, border_style="purple", width=width))
+    else:
+        print(f"{CYAN}Current Discord webhook: {current}{RESET}")
+    prompt_text = "Enter Discord webhook URL (or blank to keep): "
+    try:
+        new_url = Prompt.ask(prompt_text) if _rich_available else input(prompt_text)
+    except Exception:
+        new_url = input(prompt_text)
+    new_url = (new_url or "").strip()
     if new_url:
         state.webhook_url = new_url
         save_state(state)
         print(f"{GREEN}Webhook updated.{RESET}")
 
 def toggle_verbose_flow(state: AppState) -> None:
+
+    try:
+        clear()
+        stdout.write(print_header())
+    except Exception:
+        pass
     state.verbose_status = not state.verbose_status
     save_state(state)
     print(f"{GREEN}Verbose status is now {'ON' if state.verbose_status else 'OFF'}.{RESET}")
 
-# pick a preset real-world User-Agent as the global default
 def choose_user_agent_flow(state: AppState) -> None:
+
+    try:
+        clear()
+        stdout.write(print_header())
+    except Exception:
+        pass
     global DEFAULT_USER_AGENT
-    print(f"{PURPLE}Select a default User-Agent (used unless a monitor overrides it):{RESET}")
     keys = list(PRESET_USER_AGENTS.keys())
-    for idx, name in enumerate(keys):
-        marker = " (current)" if PRESET_USER_AGENTS[name] == (state.default_user_agent or DEFAULT_USER_AGENT) else ""
-        print(f"  {idx}) {name}{marker}")
-    s = input("Choice (number), or leave blank to cancel: ").strip()
+    if _rich_available:
+        width = _ui_width()
+        table = Table(title="Default User-Agent", box=box.SIMPLE_HEAVY)
+        table.width = width
+        table.add_column("#", style="bold cyan", no_wrap=True)
+        table.add_column("Preset", overflow="fold")
+        table.add_column("Active", style="green", no_wrap=True)
+        current_value = state.default_user_agent or DEFAULT_USER_AGENT
+        for idx, name in enumerate(keys):
+            is_current = PRESET_USER_AGENTS[name] == current_value
+            table.add_row(str(idx), name, "• current" if is_current else "")
+        _console.print(Panel(table, border_style="purple", width=width))
+        footer = "Enter a number to select a preset, or press Enter to cancel."
+        _console.print(Panel(footer, border_style="purple", width=width))
+        try:
+            s = Prompt.ask("Choice (number)")
+        except Exception:
+            s = input("Choice (number): ")
+    else:
+        print(f"{CYAN}Select a default User-Agent (used unless a monitor overrides it):{RESET}")
+        for idx, name in enumerate(keys):
+            marker = " (current)" if PRESET_USER_AGENTS[name] == (state.default_user_agent or DEFAULT_USER_AGENT) else ""
+            print(f"  {idx}) {name}{marker}")
+        s = input("Choice (number), or leave blank to cancel: ")
+    s = (s or "").strip()
     if not s:
         return
     if not s.isdigit() or not (0 <= int(s) < len(keys)):
@@ -688,6 +1031,12 @@ def choose_user_agent_flow(state: AppState) -> None:
 
 def ensure_webhook_set(state: AppState) -> None:
     while not state.webhook_url:
+        # Keep banner visible while prompting
+        try:
+            clear()
+            stdout.write(print_header())
+        except Exception:
+            pass
         print(f"{YELLOW}No Discord webhook is configured for alerts.{RESET}")
         new_url = input("Paste your Discord webhook URL (or press Enter to skip): ").strip()
         if not new_url:
@@ -718,12 +1067,12 @@ def start_monitoring(state: AppState) -> None:
         stdout.write(print_header())
         print(f"{GREEN}Monitoring started. Press Ctrl+C to stop.{RESET}")
         if state.webhook_url:
-            print(f"{PURPLE}Discord webhook is set: alerts will also be sent to your channel.{RESET}")
+            print(f"{CYAN}Discord webhook is set: alerts will also be sent to your channel.{RESET}")
         else:
             print(f"{YELLOW}Discord webhook not set; alerts will appear only in this window.{RESET}")
-        print(f"{PURPLE}Tip: For JS dashboards, enable JS-rendered mode on that monitor.{RESET}")
+        print(f"{CYAN}Tip: For JS dashboards, enable JS-rendered mode on that monitor.{RESET}")
         if state.verbose_status:
-            print(f"{PURPLE}Verbose status heartbeat is ON. Toggle from the main menu if noisy.{RESET}")
+            print(f"{CYAN}Verbose status heartbeat is ON. Toggle from the main menu if noisy.{RESET}")
         while True:
             try:
                 msg = alert_q.get(timeout=1.0)
@@ -738,8 +1087,25 @@ def start_monitoring(state: AppState) -> None:
         print(f"{GREEN}Stopped.{RESET}")
 
 # ========================
-# Main menu
+# Main menu (Rich-enhanced)
 # ========================
+
+def _render_main_menu_rich(state: AppState) -> None:
+    # Assumes screen was cleared and banner printed
+    if not _rich_available:
+        return
+    width = _ui_width()
+    table = Table(box=box.SIMPLE, show_edge=False, expand=False, padding=(0,1))
+    table.width = width - 2
+    table.add_column("#", style="bold cyan", no_wrap=True)
+    table.add_column("Menu Options", style="bold white")
+    table.add_row("1", "Manage monitors (Add/Edit/Remove/List)")
+    table.add_row("2", "Set Discord webhook")
+    table.add_row("3", "Start monitoring")
+    table.add_row("4", f"Toggle status heartbeat (currently {'ON' if state.verbose_status else 'OFF'})")
+    table.add_row("5", "Choose default User-Agent (presets)")
+    table.add_row("6", "Quit")
+    _console.print(Panel(table, border_style="purple", width=width))
 
 def main_menu():
     state = load_state()
@@ -749,35 +1115,29 @@ def main_menu():
     while True:
         clear()
         stdout.write(print_header())
-        print("1) Add a monitor")
-        print("2) Remove a monitor")
-        print("3) List monitors")
-        print("4) Set Discord webhook")
-        print("5) Start monitoring")
-        print(f"6) Toggle status heartbeat (currently {'ON' if state.verbose_status else 'OFF'})")
-        print("7) Choose default User-Agent (presets)")
-        print("8) Quit")
+        if _rich_available:
+            _render_main_menu_rich(state)
+        else:
+            print("1) Manage monitors (Add/Edit/Remove/List)")
+            print("2) Set Discord webhook")
+            print("3) Start monitoring")
+            print(f"4) Toggle status heartbeat (currently {'ON' if state.verbose_status else 'OFF'})")
+            print("5) Choose default User-Agent (presets)")
+            print("6) Quit")
         choice = input("\nSelect: ").strip()
         clear()
         if choice == "1":
-            add_monitor_flow(state)
-            input("Press Enter to continue...")
+            manage_monitors_flow(state)
         elif choice == "2":
-            remove_monitor_flow(state)
-            input("Press Enter to continue...")
-        elif choice == "3":
-            list_monitors(state)
-            input("Press Enter to continue...")
-        elif choice == "4":
             set_webhook_flow(state)
             input("Press Enter to continue...")
-        elif choice == "5":
+        elif choice == "3":
             start_monitoring(state)
-        elif choice == "6":
+        elif choice == "4":
             toggle_verbose_flow(state)
-        elif choice == "7":
+        elif choice == "5":
             choose_user_agent_flow(state)
-        elif choice == "8":
+        elif choice == "6":
             print("Bye.")
             return
         else:
