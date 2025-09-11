@@ -40,7 +40,7 @@ MonMon is a small Python 3 console app that monitors websites for changes and al
    - Optionally provide a custom User-Agent for this monitor.
    - For dynamic pages, enable JS-rendered mode and configure the wait time/selector.
    - If you provided a selector, review the preview and accept or refine it.
-3. Choose **0) Start monitoring**.
+3. Choose **3) Start monitoring**.
 
 ---
 
