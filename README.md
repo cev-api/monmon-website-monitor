@@ -31,8 +31,8 @@ MonMon is a small Python 3 console app that monitors websites for changes and al
 ---
 
 ## First-time setup
-1. Choose **4) Set Discord webhook** and paste your webhook URL.
-2. Choose **1) Add a monitor** and follow the prompts:
+1. Choose **2) Set Discord webhook** and paste your webhook URL.
+2. Choose **1) Manage Monitors** and follow the prompts:
    - Enter the target URL.
    - Enter a CSS selector or press Enter to watch the whole page.
    - Pick `text` or `html` mode.
@@ -40,7 +40,7 @@ MonMon is a small Python 3 console app that monitors websites for changes and al
    - Optionally provide a custom User-Agent for this monitor.
    - For dynamic pages, enable JS-rendered mode and configure the wait time/selector.
    - If you provided a selector, review the preview and accept or refine it.
-3. Choose **5) Start monitoring**.
+3. Choose **0) Start monitoring**.
 
 ---
 
