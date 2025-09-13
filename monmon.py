@@ -1,6 +1,5 @@
 #!/usr/bin/env python3
 
-
 import os
 import sys
 import json
@@ -98,6 +97,11 @@ class Monitor:
     js_wait_ms: int = 3000
     js_wait_selector: Optional[str] = None
 
+    # sticky status about last fetch outcome
+    last_state: Optional[str] = None    # one of: "ok", "http_error", "net_error"
+    last_code: Optional[str] = None     # e.g. "200", "404", "gaierror", "ConnectionError"
+    last_sig: Optional[str] = None      # stable signature of the error detail (hash)
+
 @dataclass
 class AppState:
     webhook_url: Optional[str]
@@ -132,6 +136,10 @@ def load_state() -> AppState:
                 use_js=bool(m.get("use_js", False)),
                 js_wait_ms=int(m.get("js_wait_ms", 3000)),
                 js_wait_selector=m.get("js_wait_selector"),
+                
+                last_state=m.get("last_state"),
+                last_code=m.get("last_code"),
+                last_sig=m.get("last_sig"),
             ))
         webhook = raw.get("webhook_url")
         verbose_status = bool(raw.get("verbose_status", False))
@@ -315,6 +323,7 @@ def send_discord(webhook_url: str, title: str, url: str, selector: Optional[str]
 # Worker thread per monitor
 # ========================
 
+# MonitorWorker with hard-sticky state and stable error signatures
 class MonitorWorker(threading.Thread):
     def __init__(self, monitor: Monitor, state: AppState, alert_queue: "queue.Queue[str]", stop_evt: threading.Event):
         super().__init__(daemon=True)
@@ -323,11 +332,73 @@ class MonitorWorker(threading.Thread):
         self.alert_queue = alert_queue
         self.stop_evt = stop_evt
 
+    # ---------- Sticky-state helpers ----------
+
+    def _host_from_url(self, url: str) -> str:
+        try:
+            if "://" in url:
+                # http[s]://host/...
+                return url.split("://", 1)[1].split("/", 1)[0]
+            # fallback
+            return url.split("/", 1)[0]
+        except Exception:
+            return ""
+
+    def _root_exc(self, e: BaseException) -> BaseException:
+        # Walk to the deepest cause/context to stabilize signatures
+        cur = e
+        seen = set()
+        while True:
+            nxt = getattr(cur, "__cause__", None) or getattr(cur, "__context__", None)
+            if not nxt or nxt in seen:
+                return cur
+            seen.add(nxt)
+            cur = nxt
+
+    def _errno_of(self, e: BaseException) -> Optional[int]:
+        # Try common places an errno might live without importing extra modules
+        for attr in ("errno", "winerror", "strerror"):
+            v = getattr(e, attr, None)
+            if isinstance(v, int):
+                return v
+        # Sometimes errno is in args[0] as int
+        try:
+            if e.args and isinstance(e.args[0], int):
+                return e.args[0]
+        except Exception:
+            pass
+        return None
+
+    def _stable_net_error_signature(self, e: BaseException, url: str) -> str:
+        root = self._root_exc(e)
+        cls = type(root).__name__
+        erno = self._errno_of(root)
+        host = self._host_from_url(url)
+        return f"{cls}:{erno if erno is not None else ''}:{host}"
+
+    def _status_tuple(self, t: Optional[str], code: Optional[str], sig: Optional[str]) -> tuple:
+        return (t or "", code or "", sig or "")
+
+    def _status_changed(self, new_t: Optional[str], new_code: Optional[str], new_sig: Optional[str]) -> bool:
+        return self._status_tuple(new_t, new_code, new_sig) != \
+               self._status_tuple(self.monitor.last_state, self.monitor.last_code, self.monitor.last_sig)
+
+    def _update_status(self, new_t: Optional[str], new_code: Optional[str], new_sig: Optional[str]) -> None:
+        self.monitor.last_state = new_t
+        self.monitor.last_code  = new_code
+        self.monitor.last_sig   = new_sig
+
+    def _selector_label(self) -> str:
+        return self.monitor.selector if self.monitor.selector else "(whole page)"
+
+    # ---------- Main loop ----------
+
     def run(self):
         first_run = True
         while not self.stop_evt.is_set():
             start_ts = time.time()
             try:
+                # ----- Fetch -----
                 if self.monitor.use_js:
                     html = fetch_rendered_html(
                         self.monitor.url,
@@ -358,28 +429,76 @@ class MonitorWorker(threading.Thread):
                         new_etag = None
                         new_lm = None
 
+                # ----- HTTP error path (sticky) -----
                 if not status_ok:
                     ts_footer = time.strftime("%Y-%m-%d %H:%M:%S")
-                    msg = f"[WARN] {self.monitor.url} responded {status_code}"
-                    self.alert_queue.put(f"{YELLOW}{msg}{RESET}")
-                    send_discord(self.state.webhook_url, "Website Access Error", self.monitor.url, self.monitor.selector, self.monitor.mode, msg, footer_text=f"Detected at {ts_footer}")
+                    new_t, new_code, new_sig = "http_error", str(status_code), None
+
+                    if self._status_changed(new_t, new_code, new_sig):
+                        msg = f"[WARN] {self.monitor.url} responded {status_code}"
+                        self.alert_queue.put(f"{YELLOW}{msg}{RESET}")
+                        send_discord(
+                            self.state.webhook_url,
+                            "Website Access Error",
+                            self.monitor.url,
+                            self.monitor.selector,
+                            self.monitor.mode,
+                            msg,
+                            footer_text=f"Detected at {ts_footer}"
+                        )
+                    elif self.state.verbose_status:
+                        ts = time.strftime("%H:%M:%S")
+                        self.alert_queue.put(f"{CYAN}[{ts}] {self.monitor.url} — still {status_code}.{RESET}")
+
+                    self._update_status(new_t, new_code, new_sig)
+                    save_state(self.state)
+
+                # ----- OK path (sticky + content diffing) -----
                 else:
+                    # Recovery notification if we were previously in any error state
+                    if self._status_changed("ok", "200", None):
+                        ts_footer = time.strftime("%Y-%m-%d %H:%M:%S")
+                        rec_msg = f"[RECOVERED] {self.monitor.url} is reachable."
+                        self.alert_queue.put(f"{GREEN}{rec_msg}{RESET}")
+                        send_discord(
+                            self.state.webhook_url,
+                            "Website Recovered",
+                            self.monitor.url,
+                            self.monitor.selector,
+                            self.monitor.mode,
+                            rec_msg,
+                            footer_text=f"Detected at {ts_footer}"
+                        )
+
+                    # Update state to OK now so any subsequent branches persist it
+                    self._update_status("ok", "200", None)
+
                     if content is None:
+                        # 304 (or JS path with no content change)
                         if self.state.verbose_status:
                             ts = time.strftime("%H:%M:%S")
                             self.alert_queue.put(f"{CYAN}[{ts}] {self.monitor.url} — no change (304).{RESET}")
+                        save_state(self.state)
                     else:
                         if self.monitor.selector and not content.strip():
                             ts = time.strftime("%H:%M:%S")
-                            self.alert_queue.put(f"{YELLOW}[{ts}] WARNING: selector returned no content for {self.monitor.url} — `{self._selector_label()}`{RESET}")
+                            self.alert_queue.put(
+                                f"{YELLOW}[{ts}] WARNING: selector returned no content for {self.monitor.url} — `{self._selector_label()}`{RESET}"
+                            )
+
                         new_hash = compute_hash(content)
+
                         if first_run and not self.monitor.last_hash:
+                            # First successful capture: baseline only
                             self.monitor.last_hash = new_hash
                             self.monitor.last_excerpt = content[:2000]
                             self.monitor.etag = new_etag
                             self.monitor.last_modified = new_lm
                             save_state(self.state)
-                            self.alert_queue.put(f"{GREEN}[BASELINE] {self.monitor.url} — {self._selector_label()} captured baseline.{RESET}")
+                            self.alert_queue.put(
+                                f"{GREEN}[BASELINE] {self.monitor.url} — {self._selector_label()} captured baseline.{RESET}"
+                            )
+
                         elif new_hash != self.monitor.last_hash:
                             old_excerpt = self.monitor.last_excerpt or ""
                             d = diff_excerpt(old_excerpt, content)
@@ -394,15 +513,13 @@ class MonitorWorker(threading.Thread):
                             self.monitor.last_modified = new_lm
                             save_state(self.state)
 
-                            # ### MODIFIED ### emit URL + diff as ONE clean block (no stray blank line)
                             combined = (
                                 f"{RED}[CHANGE {ts_hms}] {self.monitor.url} — {self._selector_label()} changed! {RESET}\n"
                                 f"{CYAN}{self.monitor.url}{RESET}\n"
-                                f"{colorize_diff(d)}\n"  # ensure trailing newline for clean end
+                                f"{colorize_diff(d)}\n"
                             )
                             self.alert_queue.put(combined)
 
-                            # Discord
                             send_discord(
                                 self.state.webhook_url,
                                 title="Website Change Detected",
@@ -416,13 +533,38 @@ class MonitorWorker(threading.Thread):
                             if self.state.verbose_status:
                                 ts = time.strftime("%H:%M:%S")
                                 self.alert_queue.put(f"{CYAN}[{ts}] {self.monitor.url} — checked, no change.{RESET}")
+                            save_state(self.state)
 
             except Exception as e:
+                # ----- Network/transport exception path (sticky with stable signature) -----
                 ts_footer = time.strftime("%Y-%m-%d %H:%M:%S")
-                msg = f"[ERROR] {self.monitor.url}: {e}"
-                self.alert_queue.put(f"{YELLOW}{msg}{RESET}")
-                send_discord(self.state.webhook_url, "Website Access Error", self.monitor.url, self.monitor.selector, self.monitor.mode, msg, footer_text=f"Detected at {ts_footer}")
 
+                # Stable signature to prevent spam across identical failures
+                new_sig = self._stable_net_error_signature(e, self.monitor.url)
+                # Coarse code = root exception class name
+                new_code = type(self._root_exc(e)).__name__
+                new_t = "net_error"
+
+                if self._status_changed(new_t, new_code, new_sig):
+                    msg = f"[ERROR] {self.monitor.url}: {e}"
+                    self.alert_queue.put(f"{YELLOW}{msg}{RESET}")
+                    send_discord(
+                        self.state.webhook_url,
+                        "Website Access Error",
+                        self.monitor.url,
+                        self.monitor.selector,
+                        self.monitor.mode,
+                        msg,
+                        footer_text=f"Detected at {ts_footer}"
+                    )
+                elif self.state.verbose_status:
+                    ts = time.strftime("%H:%M:%S")
+                    self.alert_queue.put(f"{CYAN}[{ts}] {self.monitor.url} — still unreachable ({new_code}).{RESET}")
+
+                self._update_status(new_t, new_code, new_sig)
+                save_state(self.state)
+
+            # ----- Sleep respecting interval -----
             first_run = False
             elapsed = time.time() - start_ts
             remaining = max(1, self.monitor.interval_sec - int(elapsed))
@@ -430,9 +572,6 @@ class MonitorWorker(threading.Thread):
                 if self.stop_evt.is_set():
                     break
                 time.sleep(1)
-
-    def _selector_label(self) -> str:
-        return self.monitor.selector if self.monitor.selector else "(whole page)"
 
 # ========================
 # UI helpers
@@ -1098,13 +1237,13 @@ def _render_main_menu_rich(state: AppState) -> None:
     table = Table(box=box.SIMPLE, show_edge=False, expand=False, padding=(0,1))
     table.width = width - 2
     table.add_column("#", style="bold cyan", no_wrap=True)
-    table.add_column("Menu Options", style="bold white")
+    table.add_column("Main Menu", style="bold white")
+    table.add_row("0", "Start monitoring")
     table.add_row("1", "Manage monitors (Add/Edit/Remove/List)")
     table.add_row("2", "Set Discord webhook")
-    table.add_row("3", "Start monitoring")
-    table.add_row("4", f"Toggle status heartbeat (currently {'ON' if state.verbose_status else 'OFF'})")
-    table.add_row("5", "Choose default User-Agent (presets)")
-    table.add_row("6", "Quit")
+    table.add_row("3", f"Toggle status heartbeat (currently {'ON' if state.verbose_status else 'OFF'})")
+    table.add_row("4", "Choose default User-Agent (presets)")
+    table.add_row("5", "Quit")
     _console.print(Panel(table, border_style="purple", width=width))
 
 def main_menu():
@@ -1118,26 +1257,26 @@ def main_menu():
         if _rich_available:
             _render_main_menu_rich(state)
         else:
+            print("0) Start monitoring")
             print("1) Manage monitors (Add/Edit/Remove/List)")
             print("2) Set Discord webhook")
-            print("3) Start monitoring")
-            print(f"4) Toggle status heartbeat (currently {'ON' if state.verbose_status else 'OFF'})")
-            print("5) Choose default User-Agent (presets)")
-            print("6) Quit")
+            print(f"3) Toggle status heartbeat (currently {'ON' if state.verbose_status else 'OFF'})")
+            print("4) Choose default User-Agent (presets)")
+            print("5) Quit")
         choice = input("\nSelect: ").strip()
         clear()
-        if choice == "1":
+        if choice == "0":
+            start_monitoring(state)
+        elif choice == "1":
             manage_monitors_flow(state)
         elif choice == "2":
             set_webhook_flow(state)
             input("Press Enter to continue...")
         elif choice == "3":
-            start_monitoring(state)
-        elif choice == "4":
             toggle_verbose_flow(state)
-        elif choice == "5":
+        elif choice == "4":
             choose_user_agent_flow(state)
-        elif choice == "6":
+        elif choice == "5":
             print("Bye.")
             return
         else:
