@@ -1,5 +1,14 @@
 # This script installs the required imports - easy!
-
+try:
+    __import__('playwright')
+except ImportError:
+    import pip
+    pip.main(['install', 'playwright'])
+try:
+    __import__('rich')
+except ImportError:
+    import pip
+    pip.main(['install', 'rich'])
 try:
     __import__('bs4')
 except ImportError:
