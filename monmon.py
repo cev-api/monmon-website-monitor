@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 
+
 import os
 import sys
 import json
@@ -197,6 +198,7 @@ def save_state(state: AppState) -> None:
         "monitors": [asdict(m) for m in state.monitors],
     }
     _atomic_write_json(APP_STATE_FILE, data)
+   
 
 # ========================
 # HTTP/Browser fetching & content extraction
@@ -222,22 +224,29 @@ def fetch_rendered_html(url: str, wait_ms: int, wait_selector: Optional[str]) ->
             ctx = browser.new_context(user_agent=DEFAULT_USER_AGENT)
             page = ctx.new_page()
             page.goto(url, wait_until="domcontentloaded", timeout=30000)
-            if wait_selector:
+
+            # normalize the wait_for selector
+            norm_wait = _normalize_selector_input(wait_selector) if wait_selector else None
+            if norm_wait:
                 try:
-                    page.wait_for_selector(wait_selector, timeout=max(1, wait_ms))
+                    page.wait_for_selector(norm_wait, timeout=max(1, wait_ms))
                 except Exception:
                     pass
             else:
                 time.sleep(wait_ms / 1000.0)
+
             html = page.content()
         finally:
             browser.close()
     return html
 
+
 def extract_content_from_html(html_text: str, selector: Optional[str], mode: str) -> str:
     soup = BeautifulSoup(html_text, "html.parser")
     if selector:
-        nodes = soup.select(selector)
+        # normalize selector before soup.select
+        norm_selector = _normalize_selector_input(selector)
+        nodes = soup.select(norm_selector)
         if not nodes:
             return ""
         if mode == "text":
@@ -251,6 +260,7 @@ def extract_content_from_html(html_text: str, selector: Optional[str], mode: str
             return soup.get_text(" ", strip=True)
         else:
             return str(soup)
+
 
 def extract_content(resp_text: str, selector: Optional[str], mode: str) -> str:
     return extract_content_from_html(resp_text, selector, mode)
@@ -456,7 +466,8 @@ class MonitorWorker(threading.Thread):
                 # ----- OK path (sticky + content diffing) -----
                 else:
                     # Recovery notification if we were previously in any error state
-                    if self._status_changed("ok", "200", None):
+                    if (self.monitor.last_state in ("http_error", "net_error")
+                            and self._status_changed("ok", "200", None)):
                         ts_footer = time.strftime("%Y-%m-%d %H:%M:%S")
                         rec_msg = f"[RECOVERED] {self.monitor.url} is reachable."
                         self.alert_queue.put(f"{GREEN}{rec_msg}{RESET}")
@@ -651,12 +662,45 @@ def prompt_choice(prompt: str, choices: List[str], default: str) -> str:
         if s in choices_lower:
             return choices[choices_lower.index(s)]
         print(f"{YELLOW}Choose one of: {choices}{RESET}")
+        
+    
+# normalize CSS selector input (quotes -> stripped; "a b c" -> ".a.b.c")
+def _normalize_selector_input(sel: Optional[str]) -> Optional[str]:
+    # accepts None and returns None to be drop-in safe
+    if not sel:
+        return sel
+    s = sel.strip()
+
+    # strip wrapping quotes
+    if (s.startswith('"') and s.endswith('"')) or (s.startswith("'") and s.endswith("'")):
+        s = s[1:-1].strip()
+
+    # if it already looks like a real CSS selector, keep it
+    # (has ., #, [], combinators, etc.)
+    import re
+    if re.search(r'[.#:\[\]>+~=*]', s):
+        return s
+
+    # allow comma-separated groups; convert each group of bare class tokens
+    groups = [g for g in re.split(r'\s*,\s*', s) if g]
+    out_groups = []
+    for g in groups:
+        tokens = [t for t in re.split(r'\s+', g.strip()) if t]
+        if not tokens:
+            continue
+        # only convert if tokens look like class-name fragments (avoid mangling tags)
+        if not all(re.match(r'^[A-Za-z_][-A-Za-z0-9_]*$', t) for t in tokens):
+            return s  # bail out, user probably typed real CSS already
+        out_groups.append('.' + '.'.join(tokens))
+    return ','.join(out_groups) if out_groups else s
 
 # one-shot preview (HTTP or JS) for selector checks
 def preview_selection(url: str, selector: Optional[str], mode: str, use_js: bool, js_wait_ms: int, js_wait_selector: Optional[str]) -> str:
     try:
+        # normalize wait_for so preview matches runtime behaviour
+        norm_wait = _normalize_selector_input(js_wait_selector) if js_wait_selector else None
         if use_js:
-            html = fetch_rendered_html(url, js_wait_ms, js_wait_selector)
+            html = fetch_rendered_html(url, js_wait_ms, norm_wait)
             content = extract_content_from_html(html, selector, mode)
         else:
             resp = fetch_url(url, None, None, {})
@@ -683,8 +727,8 @@ def add_monitor_flow(state: AppState) -> None:
         return
 
     selector = input("CSS selector to focus (blank for whole page): ").strip()
-    if not selector:
-        selector = None
+    # normalize main selector input
+    selector = _normalize_selector_input(selector) if selector else None
 
     mode = prompt_choice("Compare extracted 'text' or raw 'html'?", ["text", "html"], "text")
     interval = prompt_int("Check frequency in seconds", default=60, min_v=5)
@@ -704,7 +748,8 @@ def add_monitor_flow(state: AppState) -> None:
             print(f"{YELLOW}  pip install playwright && python -m playwright install chromium{RESET}")
         js_wait_ms = prompt_int("Wait milliseconds after load (JS settle time)", default=3000, min_v=0, max_v=60000)
         tmp = input("Optional CSS selector to wait for (blank to skip): ").strip()
-        js_wait_selector = tmp if tmp else None
+        # normalize wait_for input
+        js_wait_selector = _normalize_selector_input(tmp) if tmp else None
 
     # preview loop when a selector is provided
     if selector:
@@ -724,10 +769,12 @@ def add_monitor_flow(state: AppState) -> None:
                 ans = prompt_choice("Accept this selector?", ["y", "n"], "y" if prev.strip() else "n")
                 if ans.lower() == "y":
                     break
-                selector = input("Enter new CSS selector (blank to cancel): ").strip()
-                if not selector:
+                # allow user to re-enter, then normalize again
+                new_in = input("Enter new CSS selector (blank to cancel): ").strip()
+                if not new_in:
                     print(f"{YELLOW}Cancelled adding monitor.{RESET}")
                     return
+                selector = _normalize_selector_input(new_in)
 
     m = Monitor(
         id=str(uuid.uuid4()),
@@ -805,7 +852,6 @@ def edit_monitor_flow(state: AppState, index: Optional[int] = None) -> None:
             except Exception:
                 pass
 
-            # Summary table with numeric field selectors
             summary = Table(box=box.SIMPLE, show_edge=False, expand=False, padding=(0,1))
             summary.width = width - 2
             summary.add_column("Field", style="cyan", no_wrap=True)
@@ -831,7 +877,8 @@ def edit_monitor_flow(state: AppState, index: Optional[int] = None) -> None:
                     m.url = new_url
             elif cmd == "2":
                 new_sel = input("New CSS selector (blank for whole page): ").strip()
-                m.selector = new_sel if new_sel else None
+                # normalize selector
+                m.selector = _normalize_selector_input(new_sel) if new_sel else None
             elif cmd == "3":
                 m.mode = prompt_choice("Mode", ["text", "html"], m.mode)
             elif cmd == "4":
@@ -862,7 +909,8 @@ def edit_monitor_flow(state: AppState, index: Optional[int] = None) -> None:
             elif cmd == "8":
                 if m.use_js:
                     tmp = input("wait_for selector (blank for none): ").strip()
-                    m.js_wait_selector = tmp if tmp else None
+                    # normalize wait_for
+                    m.js_wait_selector = _normalize_selector_input(tmp) if tmp else None
             elif cmd == "p":
                 print(f"{CYAN}Previewing `{m.selector or '(whole page)'}` (mode={m.mode}, JS={m.use_js})...{RESET}")
                 prev = preview_selection(m.url, m.selector, m.mode, m.use_js, m.js_wait_ms, m.js_wait_selector)
@@ -899,8 +947,9 @@ def edit_monitor_flow(state: AppState, index: Optional[int] = None) -> None:
             m.url = new_url
         print(f"Current selector: {m.selector or '(whole page)'}")
         new_sel = input("New CSS selector (blank for whole page): ").strip()
+        # normalize selector
         if new_sel or new_sel == "":
-            m.selector = new_sel if new_sel else None
+            m.selector = _normalize_selector_input(new_sel) if new_sel else None
         m.mode = prompt_choice("Compare 'text' or 'html'?", ["text", "html"], m.mode)
         try:
             new_interval = input(f"Check frequency in seconds [{m.interval_sec}]: ").strip()
@@ -925,7 +974,8 @@ def edit_monitor_flow(state: AppState, index: Optional[int] = None) -> None:
             m.js_wait_ms = prompt_int("Wait milliseconds after load (JS settle time)", default=m.js_wait_ms, min_v=0, max_v=60000)
             print(f"Current wait_for selector: {m.js_wait_selector or '(none)'}")
             tmp = input("New wait_for selector (blank for none): ").strip()
-            m.js_wait_selector = tmp if tmp else None
+            # normalize wait_for
+            m.js_wait_selector = _normalize_selector_input(tmp) if tmp else None
         else:
             m.js_wait_ms = 3000
             m.js_wait_selector = None
@@ -937,6 +987,7 @@ def edit_monitor_flow(state: AppState, index: Optional[int] = None) -> None:
             m.last_modified = None
         save_state(state)
         print(f"{GREEN}Monitor updated.{RESET}")
+
 
 def list_monitors(state: AppState) -> None:
 
