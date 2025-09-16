@@ -50,7 +50,17 @@ try:
 except Exception:
     _playwright_available = False
 
-APP_STATE_FILE = "monitor_state.json"
+APP_DIR = os.path.dirname(os.path.abspath(__file__))
+
+try:
+    import __main__
+    setattr(__main__, "APP_DIR", APP_DIR)
+except Exception:
+    pass
+    
+APP_STATE_FILE = os.path.join(APP_DIR, "monitor_state.json")
+
+STATE_LOCK = threading.RLock()
 DEFAULT_USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win32; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/127.0.0.0 Safari/537.36"
 
 # ========================
@@ -103,12 +113,17 @@ class Monitor:
     last_code: Optional[str] = None     # e.g. "200", "404", "gaierror", "ConnectionError"
     last_sig: Optional[str] = None      # stable signature of the error detail (hash)
 
+    # Content-only changes option and empty-state memory
+    content_only_changes: bool = False  # if True, ignore transitions to empty/missing content
+    was_empty: Optional[bool] = None    # remembers if last *observed* content was empty when content_only_changes is True
+
 @dataclass
 class AppState:
     webhook_url: Optional[str]
-    monitors: List[Monitor]
+    monitors: List["Monitor"]
     verbose_status: bool = False
     default_user_agent: Optional[str] = None
+    deleted_ids: List[str] = None  # will be normalized to [] in load_state
 
 # ========================
 # Persistence
@@ -117,14 +132,22 @@ class AppState:
 def load_state() -> AppState:
     global DEFAULT_USER_AGENT
     if not os.path.exists(APP_STATE_FILE):
-        return AppState(webhook_url=None, monitors=[])
+        return AppState(webhook_url=None, monitors=[], deleted_ids=[])
+
     try:
-        with open(APP_STATE_FILE, "r", encoding="utf-8") as f:
-            raw = json.load(f)
-        monitors = []
+        with STATE_LOCK:
+            with open(APP_STATE_FILE, "r", encoding="utf-8") as f:
+                raw = json.load(f)
+
+        deleted_ids = list(raw.get("deleted_ids", []) or [])
+        monitors: List[Monitor] = []
         for m in raw.get("monitors", []):
+            mid = m.get("id") or str(uuid.uuid4())
+            # skip tombstoned monitors
+            if mid in deleted_ids:
+                continue
             monitors.append(Monitor(
-                id=m.get("id") or str(uuid.uuid4()),
+                id=mid,
                 url=m["url"],
                 selector=m.get("selector"),
                 mode=m.get("mode", "text"),
@@ -137,68 +160,159 @@ def load_state() -> AppState:
                 use_js=bool(m.get("use_js", False)),
                 js_wait_ms=int(m.get("js_wait_ms", 3000)),
                 js_wait_selector=m.get("js_wait_selector"),
-                
                 last_state=m.get("last_state"),
                 last_code=m.get("last_code"),
                 last_sig=m.get("last_sig"),
+                content_only_changes=bool(m.get("content_only_changes", False)),
+                was_empty=m.get("was_empty"),
             ))
+
         webhook = raw.get("webhook_url")
         verbose_status = bool(raw.get("verbose_status", False))
         default_ua = raw.get("default_user_agent")
         if default_ua:
             DEFAULT_USER_AGENT = default_ua
+
         return AppState(
-            webhook_url=webloghook if (webloghook := webhook) else None,
+            webhook_url=webhook,
             monitors=monitors,
             verbose_status=verbose_status,
-            default_user_agent=default_ua
+            default_user_agent=default_ua,
+            deleted_ids=deleted_ids,            # 
         )
     except Exception as e:
         print(f"{YELLOW}Warning: failed to read state: {e}. Starting fresh.{RESET}")
-        return AppState(webhook_url=None, monitors=[])
-
+        return AppState(webhook_url=None, monitors=[], deleted_ids=[])
+        
 # robust Windows-friendly atomic save with retries
 def _atomic_write_json(path: str, data: Dict[str, Any]) -> None:
-    attempts = 6
-    delay = 0.2
-    last_err = None
-    for i in range(attempts):
-        tmp = f"{path}.{uuid.uuid4().hex}.tmp"
-        try:
-            with open(tmp, "w", encoding="utf-8") as f:
-                json.dump(data, f, indent=2)
-                f.flush()
-                os.fsync(f.fileno())
-            os.replace(tmp, path)
-            return
-        except PermissionError as e:
-            last_err = e
+    # protect with a process-wide lock to avoid concurrent clobbering
+    with STATE_LOCK:
+        attempts = 6
+        delay = 0.2
+        last_err = None
+        for _ in range(attempts):
+            tmp = f"{path}.{uuid.uuid4().hex}.tmp"
             try:
-                if os.path.exists(tmp):
-                    os.remove(tmp)
-            except Exception:
-                pass
-            time.sleep(delay)
-            delay *= 1.5
-        except Exception as e:
-            last_err = e
-            try:
-                if os.path.exists(tmp):
-                    os.remove(tmp)
-            except Exception:
-                pass
-            time.sleep(delay)
-    raise RuntimeError(f"Failed to save state after retries: {last_err}")
+                with open(tmp, "w", encoding="utf-8") as f:
+                    json.dump(data, f, indent=2)
+                    f.flush()
+                    os.fsync(f.fileno())
+                os.replace(tmp, path)
+                return
+            except Exception as e:
+                last_err = e
+                try:
+                    if os.path.exists(tmp):
+                        os.remove(tmp)
+                except Exception:
+                    pass
+                time.sleep(delay)
+                delay *= 1.5
+        raise RuntimeError(f"Failed to save state after retries: {last_err}")
+
 
 def save_state(state: AppState) -> None:
+    # ensure the list exists
+    if state.deleted_ids is None:
+        state.deleted_ids = []
+
+    # filter out any tombstoned monitors before writing
+    live_monitors = [m for m in state.monitors if m.id not in state.deleted_ids]
+
     data = {
         "webhook_url": state.webhook_url,
         "verbose_status": state.verbose_status,
         "default_user_agent": state.default_user_agent,
-        "monitors": [asdict(m) for m in state.monitors],
+        "deleted_ids": list(state.deleted_ids),           # 
+        "monitors": [asdict(m) for m in live_monitors],   # 
     }
     _atomic_write_json(APP_STATE_FILE, data)
-   
+
+    try:
+        with STATE_LOCK:
+            with open(APP_STATE_FILE, "r", encoding="utf-8") as f:
+                _ = json.load(f)
+    except Exception:
+        pass
+      
+# Safely persist only one monitor's fields by id without rewriting the list from a stale snapshot.
+def save_monitor_delta(m: Monitor) -> None:
+    with STATE_LOCK:
+        try:
+            if not os.path.exists(APP_STATE_FILE):
+                return
+            with open(APP_STATE_FILE, "r", encoding="utf-8") as f:
+                raw = json.load(f)
+
+            deleted_ids = set(raw.get("deleted_ids", []) or [])
+            if m.id in deleted_ids:
+                # this monitor was deleted; never resurrect it
+                return
+
+            arr = raw.get("monitors", [])
+            idx = None
+            for i, itm in enumerate(arr):
+                if itm.get("id") == m.id:
+                    idx = i
+                    break
+            if idx is None:
+                # not present; do not recreate
+                return
+
+            arr[idx] = asdict(m)
+            raw["monitors"] = arr
+            raw["deleted_ids"] = list(deleted_ids)  # unchanged; keep persisted
+
+            _atomic_write_json(APP_STATE_FILE, raw)
+        except Exception:
+            pass
+
+
+# keep in-memory state synced with disk without replacing the object reference
+def reload_state_into(state: AppState) -> None:
+    with STATE_LOCK:
+        if not os.path.exists(APP_STATE_FILE):
+            return
+        try:
+            with open(APP_STATE_FILE, "r", encoding="utf-8") as f:
+                raw = json.load(f)
+        except Exception:
+            return
+
+        deleted_ids = list(raw.get("deleted_ids", []) or [])   # 
+        new_monitors: List[Monitor] = []
+        for m in raw.get("monitors", []):
+            mid = m.get("id") or str(uuid.uuid4())
+            if mid in deleted_ids:                              # 
+                continue
+            new_monitors.append(Monitor(
+                id=mid,
+                url=m["url"],
+                selector=m.get("selector"),
+                mode=m.get("mode", "text"),
+                interval_sec=int(m.get("interval_sec", 60)),
+                headers=m.get("headers", {}),
+                last_hash=m.get("last_hash"),
+                last_excerpt=m.get("last_excerpt"),
+                etag=m.get("etag"),
+                last_modified=m.get("last_modified"),
+                use_js=bool(m.get("use_js", False)),
+                js_wait_ms=int(m.get("js_wait_ms", 3000)),
+                js_wait_selector=m.get("js_wait_selector"),
+                last_state=m.get("last_state"),
+                last_code=m.get("last_code"),
+                last_sig=m.get("last_sig"),
+                content_only_changes=bool(m.get("content_only_changes", False)),
+                was_empty=m.get("was_empty"),
+            ))
+
+        state.monitors.clear()
+        state.monitors.extend(new_monitors)
+        state.webhook_url = raw.get("webhook_url")
+        state.verbose_status = bool(raw.get("verbose_status", False))
+        state.default_user_agent = raw.get("default_user_agent")
+        state.deleted_ids = deleted_ids                         # 
 
 # ========================
 # HTTP/Browser fetching & content extraction
@@ -213,11 +327,14 @@ def fetch_url(url: str, etag: Optional[str], last_modified: Optional[str], extra
         headers["If-Modified-Since"] = last_modified
     resp = requests.get(url, headers=headers, timeout=30)
     return resp
-
+    
 def fetch_rendered_html(url: str, wait_ms: int, wait_selector: Optional[str]) -> str:
+
     if not _playwright_available:
         raise RuntimeError("Playwright not installed. Run: pip install playwright && python -m playwright install chromium")
-    from playwright.sync_api import sync_playwright
+
+    from playwright.sync_api import sync_playwright  # type: ignore
+
     with sync_playwright() as pw:
         browser = pw.chromium.launch(headless=True)
         try:
@@ -225,11 +342,22 @@ def fetch_rendered_html(url: str, wait_ms: int, wait_selector: Optional[str]) ->
             page = ctx.new_page()
             page.goto(url, wait_until="domcontentloaded", timeout=30000)
 
+            # brief network-idle settle to avoid hydration flip-flops
+            try:
+                page.wait_for_load_state("networkidle", timeout=min(1500, max(1, wait_ms)))
+            except Exception:
+                pass
+
             # normalize the wait_for selector
             norm_wait = _normalize_selector_input(wait_selector) if wait_selector else None
             if norm_wait:
                 try:
                     page.wait_for_selector(norm_wait, timeout=max(1, wait_ms))
+                    # tiny settle after the node appears
+                    try:
+                        page.wait_for_timeout(250)
+                    except Exception:
+                        pass
                 except Exception:
                     pass
             else:
@@ -239,6 +367,90 @@ def fetch_rendered_html(url: str, wait_ms: int, wait_selector: Optional[str]) ->
         finally:
             browser.close()
     return html
+
+def fetch_rendered_content(url: str, selector: str, mode: str, wait_ms: int = 1500, polls: int = 3, poll_interval_ms: int = 400) -> Optional[str]:
+    """Render a page with Playwright and return stable content for selector.
+    Returns None if the selection is unstable across quick polls (so caller should ignore).
+    Uses a persistent browser profile per domain to keep cookies/AB-bucketing stable.
+    """
+    if not _playwright_available:
+        raise RuntimeError("Playwright not installed. Run: pip install playwright && python -m playwright install chromium")
+
+    from urllib.parse import urlparse
+    from pathlib import Path
+    from playwright.sync_api import sync_playwright  # type: ignore
+
+    sel = _normalize_selector_input(selector) if selector else None
+
+    # persistent profile per domain → consistent AB/cookie state across runs
+    netloc = urlparse(url).netloc or "default"
+    base_profile = Path(getattr(sys.modules.get("__main__"), "APP_DIR", os.getcwd())) / ".pw_profiles"
+    profile_dir = base_profile / netloc
+    profile_dir.mkdir(parents=True, exist_ok=True)
+
+    def _read_once(page):
+        if not sel:
+            return (page.content() or "").strip()
+        try:
+            if mode == "text":
+                val = page.eval_on_selector(sel, "el => (el.innerText||'').trim()")
+            else:
+                val = page.eval_on_selector(sel, "el => el.outerHTML")
+            return (val or "").strip()
+        except Exception:
+            return "__MISSING__"  # sentinel to distinguish from empty string
+
+    with sync_playwright() as pw:
+        ctx = pw.chromium.launch_persistent_context(
+            str(profile_dir),
+            headless=True,
+            viewport={"width": 1366, "height": 900},
+            user_agent=DEFAULT_USER_AGENT,
+        )
+        try:
+            ctx.set_extra_http_headers({
+                "Accept-Language": "en-US,en;q=0.9",
+                "DNT": "1",
+                "Upgrade-Insecure-Requests": "1",
+            })
+            page = ctx.new_page()
+            page.goto(url, wait_until="domcontentloaded", timeout=30000)
+
+            # settle network & hydrate
+            try:
+                page.wait_for_load_state("networkidle", timeout=min(2000, max(1, wait_ms)))
+            except Exception:
+                pass
+
+            # wait for selector if provided
+            if sel:
+                try:
+                    page.wait_for_selector(sel, timeout=max(1, wait_ms))
+                    page.wait_for_timeout(250)
+                except Exception:
+                    pass
+
+            readings = []
+            for _ in range(max(1, polls)):
+                readings.append(_read_once(page))
+                if poll_interval_ms > 0:
+                    try:
+                        page.wait_for_timeout(poll_interval_ms)
+                    except Exception:
+                        time.sleep(poll_interval_ms / 1000.0)
+
+            # stable if all equal
+            if len(set(readings)) == 1:
+                val = readings[0]
+                return "" if val == "__MISSING__" else val
+            else:
+                # unstable → ignore this cycle
+                return None
+        finally:
+            try:
+                ctx.close()
+            except Exception:
+                pass
 
 
 def extract_content_from_html(html_text: str, selector: Optional[str], mode: str) -> str:
@@ -334,6 +546,7 @@ def send_discord(webhook_url: str, title: str, url: str, selector: Optional[str]
 # ========================
 
 # MonitorWorker with hard-sticky state and stable error signatures
+# MonitorWorker with stable, coarse error kinds (no more spam on getaddrinfo flips)
 class MonitorWorker(threading.Thread):
     def __init__(self, monitor: Monitor, state: AppState, alert_queue: "queue.Queue[str]", stop_evt: threading.Event):
         super().__init__(daemon=True)
@@ -342,20 +555,17 @@ class MonitorWorker(threading.Thread):
         self.alert_queue = alert_queue
         self.stop_evt = stop_evt
 
-    # ---------- Sticky-state helpers ----------
+    # ---------- helpers for sticky error signatures ----------
 
     def _host_from_url(self, url: str) -> str:
         try:
             if "://" in url:
-                # http[s]://host/...
                 return url.split("://", 1)[1].split("/", 1)[0]
-            # fallback
             return url.split("/", 1)[0]
         except Exception:
             return ""
 
     def _root_exc(self, e: BaseException) -> BaseException:
-        # Walk to the deepest cause/context to stabilize signatures
         cur = e
         seen = set()
         while True:
@@ -366,12 +576,10 @@ class MonitorWorker(threading.Thread):
             cur = nxt
 
     def _errno_of(self, e: BaseException) -> Optional[int]:
-        # Try common places an errno might live without importing extra modules
-        for attr in ("errno", "winerror", "strerror"):
+        for attr in ("errno", "winerror"):
             v = getattr(e, attr, None)
             if isinstance(v, int):
                 return v
-        # Sometimes errno is in args[0] as int
         try:
             if e.args and isinstance(e.args[0], int):
                 return e.args[0]
@@ -379,12 +587,48 @@ class MonitorWorker(threading.Thread):
             pass
         return None
 
-    def _stable_net_error_signature(self, e: BaseException, url: str) -> str:
+    # classify net errors to a coarse, stable kind
+    def _classify_net_error(self, e: BaseException) -> str:
+        import socket
+        try:
+            import urllib3
+            urexc = getattr(urllib3, "exceptions", None)
+        except Exception:
+            urexc = None
+
         root = self._root_exc(e)
-        cls = type(root).__name__
-        erno = self._errno_of(root)
+        name = type(root).__name__.lower()
+
+        # DNS / name resolution
+        if "gaierror" in name or "nameresolutionerror" in name:
+            return "dns"
+        if urexc and isinstance(root, getattr(urexc, "NameResolutionError", tuple())):
+            return "dns"
+
+        # Timeouts (requests/urllib3/socket)
+        if "timeout" in name or "readtimeout" in name or "connecttimeout" in name:
+            return "timeout"
+
+        # TLS/SSL errors
+        if "ssl" in name or "tls" in name or "ssLError".lower() in name:
+            return "tls"
+
+        # Proxy / blocked
+        if "proxy" in name or "blocked" in name:
+            return "proxy"
+
+        # Connection problems (refused/reset)
+        if "connectionerror" in name or "newconnectionerror" in name or "connectionreset" in name or "refused" in name:
+            return "connect"
+
+        # Fallback
+        return "other"
+
+    # build a stable signature using coarse kind + host only
+    def _stable_net_error_signature(self, e: BaseException, url: str) -> str:
+        kind = self._classify_net_error(e)
         host = self._host_from_url(url)
-        return f"{cls}:{erno if erno is not None else ''}:{host}"
+        return f"{kind}:{host}"
 
     def _status_tuple(self, t: Optional[str], code: Optional[str], sig: Optional[str]) -> tuple:
         return (t or "", code or "", sig or "")
@@ -401,21 +645,23 @@ class MonitorWorker(threading.Thread):
     def _selector_label(self) -> str:
         return self.monitor.selector if self.monitor.selector else "(whole page)"
 
-    # ---------- Main loop ----------
+    # ---------- main loop ----------
 
     def run(self):
         first_run = True
         while not self.stop_evt.is_set():
             start_ts = time.time()
             try:
-                # ----- Fetch -----
+                # fetch
                 if self.monitor.use_js:
-                    html = fetch_rendered_html(
+                    content = fetch_rendered_content(
                         self.monitor.url,
+                        self.monitor.selector,
+                        self.monitor.mode,
                         wait_ms=max(0, int(self.monitor.js_wait_ms)),
-                        wait_selector=self.monitor.js_wait_selector
+                        polls=3,
+                        poll_interval_ms=400,
                     )
-                    content = extract_content_from_html(html, self.monitor.selector, self.monitor.mode)
                     new_etag = None
                     new_lm = None
                     status_ok = True
@@ -439,143 +685,176 @@ class MonitorWorker(threading.Thread):
                         new_etag = None
                         new_lm = None
 
-                # ----- HTTP error path (sticky) -----
+                # http error path
                 if not status_ok:
                     ts_footer = time.strftime("%Y-%m-%d %H:%M:%S")
                     new_t, new_code, new_sig = "http_error", str(status_code), None
-
                     if self._status_changed(new_t, new_code, new_sig):
                         msg = f"[WARN] {self.monitor.url} responded {status_code}"
                         self.alert_queue.put(f"{YELLOW}{msg}{RESET}")
-                        send_discord(
-                            self.state.webhook_url,
-                            "Website Access Error",
-                            self.monitor.url,
-                            self.monitor.selector,
-                            self.monitor.mode,
-                            msg,
-                            footer_text=f"Detected at {ts_footer}"
-                        )
+                        send_discord(self.state.webhook_url, "Website Access Error",
+                                     self.monitor.url, self.monitor.selector, self.monitor.mode,
+                                     msg, footer_text=f"Detected at {ts_footer}")
                     elif self.state.verbose_status:
                         ts = time.strftime("%H:%M:%S")
                         self.alert_queue.put(f"{CYAN}[{ts}] {self.monitor.url} — still {status_code}.{RESET}")
-
                     self._update_status(new_t, new_code, new_sig)
-                    save_state(self.state)
+                    save_monitor_delta(self.monitor)
 
-                # ----- OK path (sticky + content diffing) -----
+                # ok path
                 else:
-                    # Recovery notification if we were previously in any error state
-                    if (self.monitor.last_state in ("http_error", "net_error")
-                            and self._status_changed("ok", "200", None)):
-                        ts_footer = time.strftime("%Y-%m-%d %H:%M:%S")
-                        rec_msg = f"[RECOVERED] {self.monitor.url} is reachable."
-                        self.alert_queue.put(f"{GREEN}{rec_msg}{RESET}")
-                        send_discord(
-                            self.state.webhook_url,
-                            "Website Recovered",
-                            self.monitor.url,
-                            self.monitor.selector,
-                            self.monitor.mode,
-                            rec_msg,
-                            footer_text=f"Detected at {ts_footer}"
-                        )
-
-                    # Update state to OK now so any subsequent branches persist it
-                    self._update_status("ok", "200", None)
-
-                    if content is None:
-                        # 304 (or JS path with no content change)
+                    if self.monitor.use_js and content is None:
                         if self.state.verbose_status:
                             ts = time.strftime("%H:%M:%S")
-                            self.alert_queue.put(f"{CYAN}[{ts}] {self.monitor.url} — no change (304).{RESET}")
-                        save_state(self.state)
+                            self.alert_queue.put(f"{CYAN}[{ts}] {self.monitor.url} — unstable DOM; change ignored.{RESET}")
+                        self._update_status("ok", "200", None)
+                        save_monitor_delta(self.monitor)
                     else:
-                        if self.monitor.selector and not content.strip():
-                            ts = time.strftime("%H:%M:%S")
-                            self.alert_queue.put(
-                                f"{YELLOW}[{ts}] WARNING: selector returned no content for {self.monitor.url} — `{self._selector_label()}`{RESET}"
-                            )
-
-                        new_hash = compute_hash(content)
-
-                        if first_run and not self.monitor.last_hash:
-                            # First successful capture: baseline only
-                            self.monitor.last_hash = new_hash
-                            self.monitor.last_excerpt = content[:2000]
-                            self.monitor.etag = new_etag
-                            self.monitor.last_modified = new_lm
-                            save_state(self.state)
-                            self.alert_queue.put(
-                                f"{GREEN}[BASELINE] {self.monitor.url} — {self._selector_label()} captured baseline.{RESET}"
-                            )
-
-                        elif new_hash != self.monitor.last_hash:
-                            old_excerpt = self.monitor.last_excerpt or ""
-                            d = diff_excerpt(old_excerpt, content)
-
-                            ts_hms = time.strftime("%H:%M:%S")
+                        # one-time recovery alert
+                        if (
+                            self.monitor.last_state in ("http_error", "net_error")
+                            and self.monitor.last_hash is not None
+                            and self._status_changed("ok", "200", None)
+                        ):
                             ts_footer = time.strftime("%Y-%m-%d %H:%M:%S")
+                            rec_msg = f"[RECOVERED] {self.monitor.url} is reachable."
+                            self.alert_queue.put(f"{GREEN}{rec_msg}{RESET}")
+                            send_discord(self.state.webhook_url, "Website Recovered",
+                                         self.monitor.url, self.monitor.selector, self.monitor.mode,
+                                         rec_msg, footer_text=f"Detected at {ts_footer}")
 
-                            # Update state
-                            self.monitor.last_hash = new_hash
-                            self.monitor.last_excerpt = content[:2000]
-                            self.monitor.etag = new_etag
-                            self.monitor.last_modified = new_lm
-                            save_state(self.state)
+                        self._update_status("ok", "200", None)
 
-                            combined = (
-                                f"{RED}[CHANGE {ts_hms}] {self.monitor.url} — {self._selector_label()} changed! {RESET}\n"
-                                f"{CYAN}{self.monitor.url}{RESET}\n"
-                                f"{colorize_diff(d)}\n"
-                            )
-                            self.alert_queue.put(combined)
-
-                            send_discord(
-                                self.state.webhook_url,
-                                title="Website Change Detected",
-                                url=self.monitor.url,
-                                selector=self.monitor.selector,
-                                mode=self.monitor.mode,
-                                diff_text=d,
-                                footer_text=f"Detected at {ts_footer}"
-                            )
-                        else:
+                        # no-change (304)
+                        if content is None:
                             if self.state.verbose_status:
                                 ts = time.strftime("%H:%M:%S")
-                                self.alert_queue.put(f"{CYAN}[{ts}] {self.monitor.url} — checked, no change.{RESET}")
-                            save_state(self.state)
+                                self.alert_queue.put(f"{CYAN}[{ts}] {self.monitor.url} — no change (304).{RESET}")
+                            save_monitor_delta(self.monitor)
+                        else:
+                            content_str = content or ""
+                            is_empty_now = (content_str.strip() == "")
+
+                            # content-only guard (unchanged)
+                            if self.monitor.content_only_changes:
+                                if is_empty_now:
+                                    self.monitor.was_empty = True
+                                    save_monitor_delta(self.monitor)
+                                    first_run = False
+                                else:
+                                    if self.monitor.was_empty:
+                                        old_excerpt = self.monitor.last_excerpt or ""
+                                        d = diff_excerpt(old_excerpt, content_str)
+                                        ts_hms = time.strftime("%H:%M:%S")
+                                        ts_footer = time.strftime("%Y-%m-%d %H:%M:%S")
+
+                                        self.monitor.last_hash = compute_hash(content_str)
+                                        self.monitor.last_excerpt = content_str[:2000]
+                                        self.monitor.etag = new_etag
+                                        self.monitor.last_modified = new_lm
+                                        self.monitor.was_empty = False
+                                        save_monitor_delta(self.monitor)
+
+                                        combined = (
+                                            f"{RED}[CHANGE {ts_hms}] {self.monitor.url} — {self._selector_label()} changed! {RESET}"
+                                            f"{CYAN}{self.monitor.url}{RESET}"
+                                            f"{colorize_diff(d)}"
+                                        )
+                                        self.alert_queue.put(combined)
+                                        send_discord(self.state.webhook_url, "Website Change Detected",
+                                                     self.monitor.url, self.monitor.selector, self.monitor.mode,
+                                                     d, footer_text=f"Detected at {ts_footer}")
+
+                            new_hash = compute_hash(content_str)
+
+                            if first_run and not self.monitor.last_hash:
+                                self.monitor.last_hash = new_hash
+                                self.monitor.last_excerpt = content_str[:2000]
+                                self.monitor.etag = new_etag
+                                self.monitor.last_modified = new_lm
+                                if self.monitor.content_only_changes:
+                                    self.monitor.was_empty = is_empty_now
+                                save_monitor_delta(self.monitor)
+                                if self.state.verbose_status:
+                                    self.alert_queue.put(f"{GREEN}[BASELINE] {self.monitor.url} — {self._selector_label()} captured baseline.{RESET}")
+                            elif new_hash != self.monitor.last_hash:
+                                time.sleep(1.0)
+                                content2 = None
+                                try:
+                                    if self.monitor.use_js:
+                                        content2 = fetch_rendered_content(
+                                            self.monitor.url,
+                                            self.monitor.selector,
+                                            self.monitor.mode,
+                                            wait_ms=max(0, int(self.monitor.js_wait_ms)),
+                                            polls=2,
+                                            poll_interval_ms=350,
+                                        )
+                                    else:
+                                        resp2 = requests.get(self.monitor.url, headers=self.monitor.headers, timeout=30)
+                                        if 200 <= resp2.status_code < 300:
+                                            content2 = extract_content(resp2.text, self.monitor.selector, self.monitor.mode)
+                                except Exception:
+                                    content2 = None
+
+                                if content2 is not None and compute_hash(content2) == new_hash:
+                                    if self.monitor.content_only_changes and (content2.strip() == ""):
+                                        self.monitor.was_empty = True
+                                        save_monitor_delta(self.monitor)
+                                    else:
+                                        old_excerpt = self.monitor.last_excerpt or ""
+                                        d = diff_excerpt(old_excerpt, content_str)
+                                        ts_hms = time.strftime("%H:%M:%S")
+                                        ts_footer = time.strftime("%Y-%m-%d %H:%M:%S")
+
+                                        self.monitor.last_hash = new_hash
+                                        self.monitor.last_excerpt = content_str[:2000]
+                                        self.monitor.etag = new_etag
+                                        self.monitor.last_modified = new_lm
+                                        if self.monitor.content_only_changes:
+                                            self.monitor.was_empty = False
+                                        save_monitor_delta(self.monitor)
+
+                                        combined = (
+                                            f"{RED}[CHANGE {ts_hms}] {self.monitor.url} — {self._selector_label()} changed! {RESET}"
+                                            f"{CYAN}{self.monitor.url}{RESET}"
+                                            f"{colorize_diff(d)}"
+                                        )
+                                        self.alert_queue.put(combined)
+                                        send_discord(self.state.webhook_url, "Website Change Detected",
+                                                     self.monitor.url, self.monitor.selector, self.monitor.mode,
+                                                     d, footer_text=f"Detected at {ts_footer}")
+                                else:
+                                    if self.state.verbose_status:
+                                        ts = time.strftime("%H:%M:%S")
+                                        self.alert_queue.put(f"{CYAN}[{ts}] {self.monitor.url} — transient change ignored.{RESET}")
+                                    save_monitor_delta(self.monitor)
+                            else:
+                                if self.state.verbose_status:
+                                    ts = time.strftime("%H:%M:%S")
+                                    self.alert_queue.put(f"{CYAN}[{ts}] {self.monitor.url} — checked, no change.{RESET}")
+                                save_monitor_delta(self.monitor)
 
             except Exception as e:
-                # ----- Network/transport exception path (sticky with stable signature) -----
                 ts_footer = time.strftime("%Y-%m-%d %H:%M:%S")
-
-                # Stable signature to prevent spam across identical failures
-                new_sig = self._stable_net_error_signature(e, self.monitor.url)
-                # Coarse code = root exception class name
-                new_code = type(self._root_exc(e)).__name__
-                new_t = "net_error"
+                # coarse, stable kind + signature => no repeated alerts for 11001/11002 flips
+                kind = self._classify_net_error(e)
+                sig = self._stable_net_error_signature(e, self.monitor.url)
+                new_t, new_code, new_sig = "net_error", kind, sig
 
                 if self._status_changed(new_t, new_code, new_sig):
                     msg = f"[ERROR] {self.monitor.url}: {e}"
                     self.alert_queue.put(f"{YELLOW}{msg}{RESET}")
-                    send_discord(
-                        self.state.webhook_url,
-                        "Website Access Error",
-                        self.monitor.url,
-                        self.monitor.selector,
-                        self.monitor.mode,
-                        msg,
-                        footer_text=f"Detected at {ts_footer}"
-                    )
+                    send_discord(self.state.webhook_url, "Website Access Error",
+                                 self.monitor.url, self.monitor.selector, self.monitor.mode,
+                                 msg, footer_text=f"Detected at {ts_footer}")
                 elif self.state.verbose_status:
                     ts = time.strftime("%H:%M:%S")
-                    self.alert_queue.put(f"{CYAN}[{ts}] {self.monitor.url} — still unreachable ({new_code}).{RESET}")
+                    self.alert_queue.put(f"{CYAN}[{ts}] {self.monitor.url} — still unreachable ({kind}).{RESET}")
 
                 self._update_status(new_t, new_code, new_sig)
-                save_state(self.state)
+                save_monitor_delta(self.monitor)
 
-            # ----- Sleep respecting interval -----
             first_run = False
             elapsed = time.time() - start_ts
             remaining = max(1, self.monitor.interval_sec - int(elapsed))
@@ -583,6 +862,7 @@ class MonitorWorker(threading.Thread):
                 if self.stop_evt.is_set():
                     break
                 time.sleep(1)
+
 
 # ========================
 # UI helpers
@@ -751,6 +1031,10 @@ def add_monitor_flow(state: AppState) -> None:
         # normalize wait_for input
         js_wait_selector = _normalize_selector_input(tmp) if tmp else None
 
+    # offer content-only mode at creation time
+    co_ans = prompt_choice("Enable content-only changes (ignore empty/missing content)?", ["y", "n"], "n")
+    content_only = (co_ans.lower() == "y")
+
     # preview loop when a selector is provided
     if selector:
         while True:
@@ -789,16 +1073,21 @@ def add_monitor_flow(state: AppState) -> None:
         last_modified=None,
         use_js=use_js,
         js_wait_ms=js_wait_ms,
-        js_wait_selector=js_wait_selector
+        js_wait_selector=js_wait_selector,
+        content_only_changes=content_only,   # 
+        was_empty=None                       # (baseline handled on first run)
     )
     state.monitors.append(m)
     save_state(state)
     print(f"{GREEN}Added monitor for {url} ({selector or 'whole page'}), every {interval}s.{RESET}")
     if use_js:
         print(f"{CYAN}JS-rendered mode enabled (wait {js_wait_ms} ms; wait_for: {js_wait_selector or 'None'}).{RESET}")
+    if content_only:
+        print(f"{CYAN}Content-only changes: ON — empty/missing content will not trigger alerts until content appears.{RESET}")
 
 def remove_monitor_flow(state: AppState) -> None:
-    # Header will be printed by list_monitors below; but ensure banner if empty
+    reload_state_into(state)
+
     if not state.monitors:
         try:
             clear(); stdout.write(print_header())
@@ -806,21 +1095,31 @@ def remove_monitor_flow(state: AppState) -> None:
             pass
         print(f"{YELLOW}No monitors to remove.{RESET}")
         return
+
     list_monitors(state)
     idx = input("Enter index to remove: ").strip()
     try:
         i = int(idx)
         if 0 <= i < len(state.monitors):
             removed = state.monitors.pop(i)
+            # mark as tombstoned
+            if state.deleted_ids is None:
+                state.deleted_ids = []
+            if removed.id not in state.deleted_ids:
+                state.deleted_ids.append(removed.id)
             save_state(state)
+            reload_state_into(state)
             print(f"{GREEN}Removed {removed.url} ({removed.selector or 'whole page'}).{RESET}")
         else:
             print(f"{YELLOW}Index out of range.{RESET}")
     except Exception:
         print(f"{YELLOW}Invalid index.{RESET}")
 
+
+
 def edit_monitor_flow(state: AppState, index: Optional[int] = None) -> None:
-    # Streamlined Rich-driven edit menu (with text fallback)
+    reload_state_into(state)  # sync at entry
+
     if not state.monitors:
         try:
             clear(); stdout.write(print_header())
@@ -864,10 +1163,11 @@ def edit_monitor_flow(state: AppState, index: Optional[int] = None) -> None:
             summary.add_row("6 JS", "on" if m.use_js else "off")
             summary.add_row("7 JS wait", f"{m.js_wait_ms} ms" if m.use_js else "-")
             summary.add_row("8 wait_for", m.js_wait_selector or "(none)")
+            summary.add_row("9 Content-only changes", "on" if m.content_only_changes else "off")  # keep visible
 
             menu = Table.grid(padding=0)
             menu.add_column()
-            menu.add_row("Enter 1-8 to edit a field   S) Save   R) Reset   P) Preview   Q) Cancel")
+            menu.add_row("Enter 1-9 to edit a field   S) Save   R) Reset   P) Preview   Q) Cancel")
             _console.print(Panel(summary, title=f"Edit Monitor #{i}", border_style="purple", width=width))
             _console.print(Panel(menu, border_style="purple", width=width))
             cmd = input("Choice: ").strip().lower()
@@ -877,7 +1177,6 @@ def edit_monitor_flow(state: AppState, index: Optional[int] = None) -> None:
                     m.url = new_url
             elif cmd == "2":
                 new_sel = input("New CSS selector (blank for whole page): ").strip()
-                # normalize selector
                 m.selector = _normalize_selector_input(new_sel) if new_sel else None
             elif cmd == "3":
                 m.mode = prompt_choice("Mode", ["text", "html"], m.mode)
@@ -909,8 +1208,14 @@ def edit_monitor_flow(state: AppState, index: Optional[int] = None) -> None:
             elif cmd == "8":
                 if m.use_js:
                     tmp = input("wait_for selector (blank for none): ").strip()
-                    # normalize wait_for
                     m.js_wait_selector = _normalize_selector_input(tmp) if tmp else None
+            elif cmd == "9":
+                m.content_only_changes = not m.content_only_changes
+                if m.content_only_changes:
+                    print(f"{GREEN}Content-only changes: ON (empty content is ignored).{RESET}")
+                else:
+                    print(f"{GREEN}Content-only changes: OFF.{RESET}")
+                time.sleep(0.6)
             elif cmd == "p":
                 print(f"{CYAN}Previewing `{m.selector or '(whole page)'}` (mode={m.mode}, JS={m.use_js})...{RESET}")
                 prev = preview_selection(m.url, m.selector, m.mode, m.use_js, m.js_wait_ms, m.js_wait_selector)
@@ -924,10 +1229,13 @@ def edit_monitor_flow(state: AppState, index: Optional[int] = None) -> None:
                 input("Press Enter to continue...")
             elif cmd == "r":
                 m.last_hash = None; m.last_excerpt = None; m.etag = None; m.last_modified = None
+                m.was_empty = None  # 
                 print(f"{GREEN}Baseline reset. It will re-baseline on next check.{RESET}")
                 time.sleep(0.6)
             elif cmd == "s":
-                save_state(state)
+                # per-monitor delta save (prevents stale full-list rewrites)
+                save_monitor_delta(m)
+                reload_state_into(state)
                 print(f"{GREEN}Monitor updated.{RESET}")
                 time.sleep(0.6)
                 return
@@ -939,7 +1247,7 @@ def edit_monitor_flow(state: AppState, index: Optional[int] = None) -> None:
                 print(f"{YELLOW}Unknown choice.{RESET}")
                 time.sleep(0.6)
     else:
-        # Text fallback (simple prompts)
+        # text fallback
         print(f"Editing monitor [{i}] — leave blank to keep current value")
         print(f"Current URL: {m.url}")
         new_url = input("New URL: ").strip()
@@ -947,7 +1255,6 @@ def edit_monitor_flow(state: AppState, index: Optional[int] = None) -> None:
             m.url = new_url
         print(f"Current selector: {m.selector or '(whole page)'}")
         new_sel = input("New CSS selector (blank for whole page): ").strip()
-        # normalize selector
         if new_sel or new_sel == "":
             m.selector = _normalize_selector_input(new_sel) if new_sel else None
         m.mode = prompt_choice("Compare 'text' or 'html'?", ["text", "html"], m.mode)
@@ -974,18 +1281,24 @@ def edit_monitor_flow(state: AppState, index: Optional[int] = None) -> None:
             m.js_wait_ms = prompt_int("Wait milliseconds after load (JS settle time)", default=m.js_wait_ms, min_v=0, max_v=60000)
             print(f"Current wait_for selector: {m.js_wait_selector or '(none)'}")
             tmp = input("New wait_for selector (blank for none): ").strip()
-            # normalize wait_for
             m.js_wait_selector = _normalize_selector_input(tmp) if tmp else None
         else:
             m.js_wait_ms = 3000
             m.js_wait_selector = None
+
+        co = prompt_choice("Enable content-only changes (ignore empty)?", ["y", "n"], "n" if not m.content_only_changes else "y")
+        m.content_only_changes = (co.lower() == "y")
+
         reset_baseline = prompt_choice("Reset baseline (recommended after edits)?", ["y", "n"], "y")
         if reset_baseline.lower() == "y":
             m.last_hash = None
             m.last_excerpt = None
             m.etag = None
             m.last_modified = None
-        save_state(state)
+            m.was_empty = None  # 
+        # per-monitor delta save
+        save_monitor_delta(m)
+        reload_state_into(state)
         print(f"{GREEN}Monitor updated.{RESET}")
 
 
@@ -1025,14 +1338,14 @@ def list_monitors(state: AppState) -> None:
 
 
 def manage_monitors_flow(state: AppState) -> None:
-    # Integrated Add/Edit/Remove/List view
     while True:
+        reload_state_into(state)  # keep memory in sync each loop
+
         try:
             clear(); stdout.write(print_header())
         except Exception:
             pass
 
-        # Render list inline
         if _rich_available:
             width = _ui_width()
             table = Table(title="Monitors", box=box.SIMPLE)
@@ -1045,9 +1358,14 @@ def manage_monitors_flow(state: AppState) -> None:
             table.add_column("JS", style="yellow", no_wrap=True)
             for i, m in enumerate(state.monitors):
                 table.add_row(
-                    str(i), m.url, (m.selector or "(page)")[:12], m.mode, f"{m.interval_sec}s", "yes" if m.use_js else "no"
+                    str(i),
+                    m.url,
+                    (m.selector or "(whole page)"),
+                    m.mode,
+                    f"{m.interval_sec}s",
+                    "on" if m.use_js else "off",
                 )
-            _console.print(Panel(table, border_style="purple", width=width))
+            _console.print(table)
             actions = Table.grid(padding=0)
             actions.add_column()
             actions.add_row("A) Add   E) Edit   R) Remove   V) Preview   Q) Back")
@@ -1065,55 +1383,45 @@ def manage_monitors_flow(state: AppState) -> None:
             add_monitor_flow(state)
         elif cmd == "e":
             if not state.monitors:
-                print(f"{YELLOW}No monitors to edit.{RESET}")
-                time.sleep(0.7)
-                continue
+                print(f"{YELLOW}No monitors to edit.{RESET}"); time.sleep(0.7); continue
             s = input("Index to edit: ").strip()
             if not s.isdigit():
-                print(f"{YELLOW}Enter a valid index.{RESET}")
-                time.sleep(0.7)
-                continue
+                print(f"{YELLOW}Enter a valid index.{RESET}"); time.sleep(0.7); continue
             i = int(s)
             if 0 <= i < len(state.monitors):
-                # edit flow will manage its own UI
                 edit_monitor_flow(state, i)
             else:
-                print(f"{YELLOW}Index out of range.{RESET}")
-                time.sleep(0.7)
+                print(f"{YELLOW}Index out of range.{RESET}"); time.sleep(0.7)
         elif cmd == "r":
             if not state.monitors:
-                print(f"{YELLOW}No monitors to remove.{RESET}")
-                time.sleep(0.7)
-                continue
+                print(f"{YELLOW}No monitors to remove.{RESET}"); time.sleep(0.7); continue
             s = input("Index to remove: ").strip()
             try:
                 i = int(s)
                 if 0 <= i < len(state.monitors):
                     removed = state.monitors.pop(i)
+                    # tombstone the id so no path can resurrect it
+                    if state.deleted_ids is None:
+                        state.deleted_ids = []
+                    if removed.id not in state.deleted_ids:
+                        state.deleted_ids.append(removed.id)
                     save_state(state)
+                    reload_state_into(state)
                     print(f"{GREEN}Removed {removed.url} ({removed.selector or 'whole page'}).{RESET}")
                     time.sleep(0.7)
                 else:
-                    print(f"{YELLOW}Index out of range.{RESET}")
-                    time.sleep(0.7)
+                    print(f"{YELLOW}Index out of range.{RESET}"); time.sleep(0.7)
             except Exception:
-                print(f"{YELLOW}Invalid index.{RESET}")
-                time.sleep(0.7)
+                print(f"{YELLOW}Invalid index.{RESET}"); time.sleep(0.7)
         elif cmd == "v":
             if not state.monitors:
-                print(f"{YELLOW}No monitors to preview.{RESET}")
-                time.sleep(0.7)
-                continue
+                print(f"{YELLOW}No monitors to preview.{RESET}"); time.sleep(0.7); continue
             s = input("Index to preview: ").strip()
             if not s.isdigit():
-                print(f"{YELLOW}Enter a valid index.{RESET}")
-                time.sleep(0.7)
-                continue
+                print(f"{YELLOW}Enter a valid index.{RESET}"); time.sleep(0.7); continue
             i = int(s)
             if not (0 <= i < len(state.monitors)):
-                print(f"{YELLOW}Index out of range.{RESET}")
-                time.sleep(0.7)
-                continue
+                print(f"{YELLOW}Index out of range.{RESET}"); time.sleep(0.7); continue
             m = state.monitors[i]
             print(f"{CYAN}Previewing `{m.selector or '(whole page)'}` (mode={m.mode}, JS={m.use_js})...{RESET}")
             prev = preview_selection(m.url, m.selector, m.mode, m.use_js, m.js_wait_ms, m.js_wait_selector)
@@ -1128,8 +1436,7 @@ def manage_monitors_flow(state: AppState) -> None:
         elif cmd == "q":
             return
         else:
-            print(f"{YELLOW}Unknown choice.{RESET}")
-            time.sleep(0.7)
+            print(f"{YELLOW}Unknown choice.{RESET}"); time.sleep(0.7)
 
 def set_webhook_flow(state: AppState) -> None:
 
