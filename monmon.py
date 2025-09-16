@@ -72,7 +72,8 @@ DEFAULT_USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win32; x64) AppleWebKit/537.
 RED   = "\033[91m"
 YELLOW= "\033[93m"
 GREEN = "\033[92m"                 
-CYAN  = "\033[38;2;150;82;214m"   # royal purple (headers/info)
+PURPLE  = "\033[38;2;150;82;214m"  
+WHITE = "\033[37m"
 RESET = "\033[0m"
 
 # common real-browsers UA presets
@@ -506,13 +507,13 @@ def diff_excerpt(old: str, new: str, limit_lines: int = 40) -> str:
         diff_lines = head + ["... (diff truncated) ..."] + tail
     return "\n".join(diff_lines) if diff_lines else "(content changed, but diff is empty)"
 
-# colorize unified diff for console (red - / green + / purple headers)
+# colorize unified diff for console (red - / green + / white headers)
 def colorize_diff(diff_text: str) -> str:
     lines = diff_text.splitlines()
     colored = []
     for ln in lines:
         if ln.startswith('+++') or ln.startswith('---') or ln.startswith('@@'):
-            colored.append(CYAN + ln + RESET)
+            colored.append(WHITE + ln + RESET)
         elif ln.startswith('+') and not ln.startswith('+++'):
             colored.append(GREEN + ln + RESET)
         elif ln.startswith('-') and not ln.startswith('---'):
@@ -559,9 +560,6 @@ def send_discord(webhook_url: str, title: str, url: str, selector: Optional[str]
 # Worker thread per monitor
 # ========================
 
-# MonitorWorker with hard-sticky state and stable error signatures
-# MonitorWorker with stable, coarse error kinds (no more spam on getaddrinfo flips)
-#  full class replacement to add missing helpers and heartbeat
 class MonitorWorker(threading.Thread):
     def __init__(self, monitor: "Monitor", state: "AppState", alert_queue: "queue.Queue[str]", stop_evt: threading.Event):
         super().__init__(daemon=True)
@@ -578,16 +576,18 @@ class MonitorWorker(threading.Thread):
 
     # : detect if observable status actually changed
     def _status_changed(self, new_type: str, new_code: Optional[str], new_sig: Optional[str]) -> bool:
+        #  use correct persisted fields
         prev_t = getattr(self.monitor, "last_state", None)
-        prev_c = getattr(self.monitor, "last_status_code", None)
-        prev_s = getattr(self.monitor, "last_error_sig", None)
+        prev_c = getattr(self.monitor, "last_code", None)
+        prev_s = getattr(self.monitor, "last_sig", None)
         return (new_type != prev_t) or (new_code != prev_c) or (new_sig != prev_s)
 
     # : write current status back into the monitor object
     def _update_status(self, new_type: str, new_code: Optional[str], new_sig: Optional[str]) -> None:
+        #  write to correct fields
         self.monitor.last_state = new_type
-        self.monitor.last_status_code = new_code
-        self.monitor.last_error_sig = new_sig
+        self.monitor.last_code = new_code
+        self.monitor.last_sig = new_sig
 
     # : normalize network/transport error kinds for stable logging
     def _classify_net_error(self, exc: Exception) -> str:
@@ -600,6 +600,15 @@ class MonitorWorker(threading.Thread):
         if isinstance(exc, SSLError) or "ssl" in emsg:
             return "tls_error"
         if isinstance(exc, ReqConnErr):
+            # Could be DNS underneath; check strings too
+            if "gaierror" in emsg or "dns" in emsg or "getaddrinfo" in emsg or "name or service not known" in emsg:
+                return "dns"
+            if "refused" in emsg:
+                return "refused"
+            if "reset" in emsg:
+                return "reset"
+            if "proxy" in emsg:
+                return "proxy_error"
             return "connect_error"
         if isinstance(exc, socket.gaierror) or "dns" in emsg or "name or service not known" in emsg or "getaddrinfo" in emsg:
             return "dns"
@@ -611,11 +620,13 @@ class MonitorWorker(threading.Thread):
             return "proxy_error"
         return "net_error"
 
-    # : make a short signature so repeated identical errors don't spam recoveries
+    # : make a short, STABLE signature so repeated identical errors don't spam recoveries
     def _stable_net_error_signature(self, exc: Exception, url: str) -> str:
-        import traceback
-        tb = "".join(traceback.format_exception_only(type(exc), exc)).strip()
-        core = f"{type(exc).__name__}:{tb}:{url.split('//',1)[-1].split('/',1)[0]}"
+        #  ignore volatile memory addresses; tie signature to (kind, host)
+        from urllib.parse import urlsplit
+        kind = self._classify_net_error(exc)
+        host = urlsplit(url).netloc or url
+        core = f"{kind}:{host}"
         return hashlib.sha256(core.encode("utf-8", "ignore")).hexdigest()[:16]
 
     def run(self):
@@ -627,7 +638,7 @@ class MonitorWorker(threading.Thread):
             if self.state.verbose_status:
                 try:
                     ts = time.strftime("%H:%M:%S")
-                    self.alert_queue.put(f"{CYAN}[{ts}] {self.monitor.url} — checking...{RESET}")
+                    self.alert_queue.put(f"{WHITE}[{ts}] {self.monitor.url} — checking...{RESET}")
                 except Exception:
                     pass
 
@@ -677,7 +688,7 @@ class MonitorWorker(threading.Thread):
                                      msg, footer_text=f"Detected at {ts_footer}")
                     elif self.state.verbose_status:
                         ts = time.strftime("%H:%M:%S")
-                        self.alert_queue.put(f"{CYAN}[{ts}] {self.monitor.url} — still {status_code}.{RESET}")
+                        self.alert_queue.put(f"{WHITE}[{ts}] {self.monitor.url} — still {status_code}.{RESET}")
                     self._update_status(new_t, new_code, new_sig)
                     save_monitor_delta(self.monitor)
 
@@ -687,7 +698,7 @@ class MonitorWorker(threading.Thread):
                     if self.monitor.use_js and content is None:
                         if self.state.verbose_status:
                             ts = time.strftime("%H:%M:%S")
-                            self.alert_queue.put(f"{CYAN}[{ts}] {self.monitor.url} — unstable DOM; change ignored.{RESET}")
+                            self.alert_queue.put(f"{WHITE}[{ts}] {self.monitor.url} — unstable DOM; change ignored.{RESET}")
                         self._update_status("ok", "200", None)
                         save_monitor_delta(self.monitor)
 
@@ -710,7 +721,7 @@ class MonitorWorker(threading.Thread):
                         if content is None:
                             if self.state.verbose_status:
                                 ts = time.strftime("%H:%M:%S")
-                                self.alert_queue.put(f"{CYAN}[{ts}] {self.monitor.url} — no change (304).{RESET}")
+                                self.alert_queue.put(f"{WHITE}[{ts}] {self.monitor.url} — no change (304).{RESET}")
                             save_monitor_delta(self.monitor)
 
                         else:
@@ -739,7 +750,7 @@ class MonitorWorker(threading.Thread):
 
                                         combined = (
                                             f"{RED}[CHANGE {ts_hms}] {self.monitor.url} — {self._selector_label()} changed! {RESET}"
-                                            f"{CYAN}{self.monitor.url}{RESET}"
+                                            f"{WHITE}{self.monitor.url}{RESET}"
                                             f"{colorize_diff(d)}"
                                         )
                                         self.alert_queue.put(combined)
@@ -802,7 +813,7 @@ class MonitorWorker(threading.Thread):
 
                                         combined = (
                                             f"{RED}[CHANGE {ts_hms}] {self.monitor.url} — {self._selector_label()} changed! {RESET}"
-                                            f"{CYAN}{self.monitor.url}{RESET}"
+                                            f"{WHITE}{self.monitor.url}{RESET}"
                                             f"{colorize_diff(d)}"
                                         )
                                         self.alert_queue.put(combined)
@@ -812,19 +823,19 @@ class MonitorWorker(threading.Thread):
                                 else:
                                     if self.state.verbose_status:
                                         ts = time.strftime("%H:%M:%S")
-                                        self.alert_queue.put(f"{CYAN}[{ts}] {self.monitor.url} — transient change ignored.{RESET}")
+                                        self.alert_queue.put(f"{WHITE}[{ts}] {self.monitor.url} — transient change ignored.{RESET}")
                                     save_monitor_delta(self.monitor)
                             else:
                                 if self.state.verbose_status:
                                     ts = time.strftime("%H:%M:%S")
-                                    self.alert_queue.put(f"{CYAN}[{ts}] {self.monitor.url} — checked, no change.{RESET}")
+                                    self.alert_queue.put(f"{WHITE}[{ts}] {self.monitor.url} — checked, no change.{RESET}")
                                 save_monitor_delta(self.monitor)
 
             except Exception as e:
                 # network/transport error path
                 ts_footer = time.strftime("%Y-%m-%d %H:%M:%S")
                 kind = self._classify_net_error(e)
-                sig = self._stable_net_error_signature(e, self.monitor.url)
+                sig = self._stable_net_error_signature(e, self.monitor.url)  #  stable signature
                 new_t, new_code, new_sig = "net_error", kind, sig
 
                 if self._status_changed(new_t, new_code, new_sig):
@@ -835,9 +846,9 @@ class MonitorWorker(threading.Thread):
                                  msg, footer_text=f"Detected at {ts_footer}")
                 elif self.state.verbose_status:
                     ts = time.strftime("%H:%M:%S")
-                    self.alert_queue.put(f"{CYAN}[{ts}] {self.monitor.url} — still unreachable ({kind}).{RESET}")
+                    self.alert_queue.put(f"{WHITE}[{ts}] {self.monitor.url} — still unreachable ({kind}).{RESET}")
 
-                self._update_status(new_t, new_code, new_sig)
+                self._update_status(new_t, new_code, new_sig)  #  persist to correct fields
                 save_monitor_delta(self.monitor)
 
             first_run = False
@@ -1022,7 +1033,7 @@ def add_monitor_flow(state: AppState) -> None:
     # preview loop when a selector is provided
     if selector:
         while True:
-            print(f"{CYAN}Previewing selector `{selector}` (mode={mode}, JS={use_js})...{RESET}")
+            print(f"{PURPLE}Previewing selector `{selector}` (mode={mode}, JS={use_js})...{RESET}")
             prev = preview_selection(url, selector, mode, use_js, js_wait_ms, js_wait_selector)
             if prev.startswith("[ERROR]"):
                 print(f"{YELLOW}{prev}{RESET}")
@@ -1065,9 +1076,9 @@ def add_monitor_flow(state: AppState) -> None:
     save_state(state)
     print(f"{GREEN}Added monitor for {url} ({selector or 'whole page'}), every {interval}s.{RESET}")
     if use_js:
-        print(f"{CYAN}JS-rendered mode enabled (wait {js_wait_ms} ms; wait_for: {js_wait_selector or 'None'}).{RESET}")
+        print(f"{PURPLE}JS-rendered mode enabled (wait {js_wait_ms} ms; wait_for: {js_wait_selector or 'None'}).{RESET}")
     if content_only:
-        print(f"{CYAN}Content-only changes: ON — empty/missing content will not trigger alerts until content appears.{RESET}")
+        print(f"{PURPLE}Content-only changes: ON — empty/missing content will not trigger alerts until content appears.{RESET}")
 
 def remove_monitor_flow(state: AppState) -> None:
     reload_state_into(state)
@@ -1137,7 +1148,7 @@ def edit_monitor_flow(state: AppState, index: Optional[int] = None) -> None:
 
             summary = Table(box=box.SIMPLE, show_edge=False, expand=False, padding=(0,1))
             summary.width = width - 2
-            summary.add_column("Field", style="cyan", no_wrap=True)
+            summary.add_column("Field", style="PURPLE", no_wrap=True)
             summary.add_column("Value", overflow="fold", max_width=width-16)
             summary.add_row("1 URL", m.url)
             summary.add_row("2 Selector", m.selector or "(whole page)")
@@ -1201,7 +1212,7 @@ def edit_monitor_flow(state: AppState, index: Optional[int] = None) -> None:
                     print(f"{GREEN}Content-only changes: OFF.{RESET}")
                 time.sleep(0.6)
             elif cmd == "p":
-                print(f"{CYAN}Previewing `{m.selector or '(whole page)'}` (mode={m.mode}, JS={m.use_js})...{RESET}")
+                print(f"{PURPLE}Previewing `{m.selector or '(whole page)'}` (mode={m.mode}, JS={m.use_js})...{RESET}")
                 prev = preview_selection(m.url, m.selector, m.mode, m.use_js, m.js_wait_ms, m.js_wait_selector)
                 if prev.startswith("[ERROR]"):
                     print(f"{YELLOW}{prev}{RESET}")
@@ -1300,7 +1311,7 @@ def list_monitors(state: AppState) -> None:
         width = _ui_width()
         table = Table(title="Configured Monitors", box=box.SIMPLE)
         table.width = width
-        table.add_column("#", style="bold cyan", no_wrap=True)
+        table.add_column("#", style="bold PURPLE", no_wrap=True)
         table.add_column("URL", overflow="fold", max_width=max(20, width-34))
         table.add_column("Sel", overflow="fold", max_width=12)
         table.add_column("Mode", style="magenta", no_wrap=True)
@@ -1334,7 +1345,7 @@ def manage_monitors_flow(state: AppState) -> None:
             width = _ui_width()
             table = Table(title="Monitors", box=box.SIMPLE)
             table.width = width
-            table.add_column("#", style="bold cyan", no_wrap=True)
+            table.add_column("#", style="bold PURPLE", no_wrap=True)
             table.add_column("URL", overflow="fold", max_width=max(20, width-34))
             table.add_column("Sel", overflow="fold", max_width=12)
             table.add_column("Mode", style="magenta", no_wrap=True)
@@ -1407,7 +1418,7 @@ def manage_monitors_flow(state: AppState) -> None:
             if not (0 <= i < len(state.monitors)):
                 print(f"{YELLOW}Index out of range.{RESET}"); time.sleep(0.7); continue
             m = state.monitors[i]
-            print(f"{CYAN}Previewing `{m.selector or '(whole page)'}` (mode={m.mode}, JS={m.use_js})...{RESET}")
+            print(f"{PURPLE}Previewing `{m.selector or '(whole page)'}` (mode={m.mode}, JS={m.use_js})...{RESET}")
             prev = preview_selection(m.url, m.selector, m.mode, m.use_js, m.js_wait_ms, m.js_wait_selector)
             if prev.startswith("[ERROR]"):
                 print(f"{YELLOW}{prev}{RESET}")
@@ -1434,14 +1445,14 @@ def set_webhook_flow(state: AppState) -> None:
         width = _ui_width()
         table = Table(box=box.SIMPLE, show_edge=False)
         table.width = width - 2
-        table.add_column("Field", style="cyan", no_wrap=True)
+        table.add_column("Field", style="PURPLE", no_wrap=True)
         table.add_column("Value")
         table.add_row("Current", current)
         instructions = "Paste your Discord webhook URL to update, or leave blank to keep the current value."
         _console.print(Panel(table, title="Discord Webhook", border_style="purple", width=width))
         _console.print(Panel(instructions, border_style="purple", width=width))
     else:
-        print(f"{CYAN}Current Discord webhook: {current}{RESET}")
+        print(f"{PURPLE}Current Discord webhook: {current}{RESET}")
     prompt_text = "Enter Discord webhook URL (or blank to keep): "
     try:
         new_url = Prompt.ask(prompt_text) if _rich_available else input(prompt_text)
@@ -1477,7 +1488,7 @@ def choose_user_agent_flow(state: AppState) -> None:
         width = _ui_width()
         table = Table(title="Default User-Agent", box=box.SIMPLE_HEAVY)
         table.width = width
-        table.add_column("#", style="bold cyan", no_wrap=True)
+        table.add_column("#", style="bold PURPLE", no_wrap=True)
         table.add_column("Preset", overflow="fold")
         table.add_column("Active", style="green", no_wrap=True)
         current_value = state.default_user_agent or DEFAULT_USER_AGENT
@@ -1492,7 +1503,7 @@ def choose_user_agent_flow(state: AppState) -> None:
         except Exception:
             s = input("Choice (number): ")
     else:
-        print(f"{CYAN}Select a default User-Agent (used unless a monitor overrides it):{RESET}")
+        print(f"{PURPLE}Select a default User-Agent (used unless a monitor overrides it):{RESET}")
         for idx, name in enumerate(keys):
             marker = " (current)" if PRESET_USER_AGENTS[name] == (state.default_user_agent or DEFAULT_USER_AGENT) else ""
             print(f"  {idx}) {name}{marker}")
@@ -1548,12 +1559,12 @@ def start_monitoring(state: AppState) -> None:
         stdout.write(print_header())
         print(f"{GREEN}Monitoring started. Press Ctrl+C to stop.{RESET}")
         if state.webhook_url:
-            print(f"{CYAN}Discord webhook is set: alerts will also be sent to your channel.{RESET}")
+            print(f"{PURPLE}Discord webhook is set: alerts will also be sent to your channel.{RESET}")
         else:
             print(f"{YELLOW}Discord webhook not set; alerts will appear only in this window.{RESET}")
-        print(f"{CYAN}Tip: For JS dashboards, enable JS-rendered mode on that monitor.{RESET}")
+        print(f"{PURPLE}Tip: For JS dashboards, enable JS-rendered mode on that monitor.{RESET}")
         if state.verbose_status:
-            print(f"{CYAN}Verbose status heartbeat is ON. Toggle from the main menu if noisy.{RESET}")
+            print(f"{PURPLE}Verbose status heartbeat is ON. Toggle from the main menu if noisy.{RESET}")
         while True:
             try:
                 msg = alert_q.get(timeout=1.0)
@@ -1578,7 +1589,7 @@ def _render_main_menu_rich(state: AppState) -> None:
     width = _ui_width()
     table = Table(box=box.SIMPLE, show_edge=False, expand=False, padding=(0,1))
     table.width = width - 2
-    table.add_column("#", style="bold cyan", no_wrap=True)
+    table.add_column("#", style="bold PURPLE", no_wrap=True)
     table.add_column("Main Menu", style="bold white")
     table.add_row("0", "Start monitoring")
     table.add_row("1", "Manage monitors (Add/Edit/Remove/List)")
