@@ -19,6 +19,11 @@ MonMon is a small Python 3 console app that monitors websites for changes and al
 - Optional heartbeat status that prints “checked, no change”.
 - Preset User-Agent selection (Windows, macOS, Linux, mobile, etc.).
 - Saves full diffs to `diffs/` when a message has to be truncated.
+- Content-only mode: Ignore empty/missing content until it reappears, useful for elements that vanish temporarily.
+- Smart selector normalization: Automatically fixes simple class names (`foo bar` → `.foo.bar`).
+- Safe baseline reset: Re-baseline a monitor from the edit menu without triggering a false alert.
+- Stable error categories: DNS, timeout, TLS, proxy, and connection errors are grouped to avoid noisy flip-flopping.
+- Rich-enhanced UI**: If installed, menus and monitor lists are styled; otherwise, plain console mode is used.
   
 ---
 
@@ -96,6 +101,7 @@ For sites that rely on client-side rendering (SPAs, dashboards), enable JS mode 
 - **Access errors (4xx/5xx, timeouts):** These are shown in the console and also sent to Discord as “Website Access Error.”
 - **Local/HTTPS issues:** For non-public endpoints, ensure the machine running the monitor can reach them and that your URL scheme (`http://` vs `https://`) is correct.
 - **Too noisy:** Switch to `text` mode, narrow your selector, increase `interval_sec`, or disable heartbeat.
+
 
 ---
 
