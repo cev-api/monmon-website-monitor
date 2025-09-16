@@ -58,6 +58,8 @@ try:
 except Exception:
     pass
     
+_DOMAIN_LOCKS: Dict[str, threading.Lock] = {}
+    
 APP_STATE_FILE = os.path.join(APP_DIR, "monitor_state.json")
 
 STATE_LOCK = threading.RLock()
@@ -367,11 +369,22 @@ def fetch_rendered_html(url: str, wait_ms: int, wait_selector: Optional[str]) ->
         finally:
             browser.close()
     return html
+    
+def _get_domain_lock(netloc: str) -> threading.Lock:
+    # return a process-wide lock for this domain
+    with STATE_LOCK:
+        lk = _DOMAIN_LOCKS.get(netloc)
+        if lk is None:
+            lk = threading.Lock()
+            _DOMAIN_LOCKS[netloc] = lk
+        return lk
 
-def fetch_rendered_content(url: str, selector: str, mode: str, wait_ms: int = 1500, polls: int = 3, poll_interval_ms: int = 400) -> Optional[str]:
-    """Render a page with Playwright and return stable content for selector.
-    Returns None if the selection is unstable across quick polls (so caller should ignore).
-    Uses a persistent browser profile per domain to keep cookies/AB-bucketing stable.
+def fetch_rendered_content(url: str, selector: str, mode: str,
+                           wait_ms: int = 1500, polls: int = 3, poll_interval_ms: int = 400) -> Optional[str]:
+    """
+    Render a page and return stable content for selector.
+    SERIALIZED per-domain to avoid Chromium user-data-dir contention that stalls other monitors
+    on the same host. Returns None if readings across quick polls are unstable.
     """
     if not _playwright_available:
         raise RuntimeError("Playwright not installed. Run: pip install playwright && python -m playwright install chromium")
@@ -382,11 +395,12 @@ def fetch_rendered_content(url: str, selector: str, mode: str, wait_ms: int = 15
 
     sel = _normalize_selector_input(selector) if selector else None
 
-    # persistent profile per domain → consistent AB/cookie state across runs
     netloc = urlparse(url).netloc or "default"
     base_profile = Path(getattr(sys.modules.get("__main__"), "APP_DIR", os.getcwd())) / ".pw_profiles"
     profile_dir = base_profile / netloc
     profile_dir.mkdir(parents=True, exist_ok=True)
+
+    dom_lock = _get_domain_lock(netloc)  # 
 
     def _read_once(page):
         if not sel:
@@ -398,60 +412,60 @@ def fetch_rendered_content(url: str, selector: str, mode: str, wait_ms: int = 15
                 val = page.eval_on_selector(sel, "el => el.outerHTML")
             return (val or "").strip()
         except Exception:
-            return "__MISSING__"  # sentinel to distinguish from empty string
+            return "__MISSING__"
 
     with sync_playwright() as pw:
-        ctx = pw.chromium.launch_persistent_context(
-            str(profile_dir),
-            headless=True,
-            viewport={"width": 1366, "height": 900},
-            user_agent=DEFAULT_USER_AGENT,
-        )
-        try:
-            ctx.set_extra_http_headers({
-                "Accept-Language": "en-US,en;q=0.9",
-                "DNT": "1",
-                "Upgrade-Insecure-Requests": "1",
-            })
-            page = ctx.new_page()
-            page.goto(url, wait_until="domcontentloaded", timeout=30000)
-
-            # settle network & hydrate
+        #  serialize per domain to prevent user-data-dir contention
+        with dom_lock:
+            ctx = pw.chromium.launch_persistent_context(
+                str(profile_dir),
+                headless=True,
+                viewport={"width": 1366, "height": 900},
+                user_agent=DEFAULT_USER_AGENT,
+            )
             try:
-                page.wait_for_load_state("networkidle", timeout=min(2000, max(1, wait_ms)))
-            except Exception:
-                pass
+                ctx.set_extra_http_headers({
+                    "Accept-Language": "en-US,en;q=0.9",
+                    "DNT": "1",
+                    "Upgrade-Insecure-Requests": "1",
+                })
+                page = ctx.new_page()
+                page.goto(url, wait_until="domcontentloaded", timeout=30000)
 
-            # wait for selector if provided
-            if sel:
+                # settle network & hydrate
                 try:
-                    page.wait_for_selector(sel, timeout=max(1, wait_ms))
-                    page.wait_for_timeout(250)
+                    page.wait_for_load_state("networkidle", timeout=min(2000, max(1, wait_ms)))
                 except Exception:
                     pass
 
-            readings = []
-            for _ in range(max(1, polls)):
-                readings.append(_read_once(page))
-                if poll_interval_ms > 0:
+                # wait for selector if provided
+                if sel:
                     try:
-                        page.wait_for_timeout(poll_interval_ms)
+                        page.wait_for_selector(sel, timeout=max(1, wait_ms))
+                        page.wait_for_timeout(250)
                     except Exception:
-                        time.sleep(poll_interval_ms / 1000.0)
+                        pass
 
-            # stable if all equal
-            if len(set(readings)) == 1:
-                val = readings[0]
-                return "" if val == "__MISSING__" else val
-            else:
-                # unstable → ignore this cycle
-                return None
-        finally:
-            try:
-                ctx.close()
-            except Exception:
-                pass
+                readings = []
+                for _ in range(max(1, polls)):
+                    readings.append(_read_once(page))
+                    if poll_interval_ms > 0:
+                        try:
+                            page.wait_for_timeout(poll_interval_ms)
+                        except Exception:
+                            time.sleep(poll_interval_ms / 1000.0)
 
+                # stable if all equal
+                if len(set(readings)) == 1:
+                    val = readings[0]
+                    return "" if val == "__MISSING__" else val
+                else:
+                    return None
+            finally:
+                try:
+                    ctx.close()
+                except Exception:
+                    pass
 
 def extract_content_from_html(html_text: str, selector: Optional[str], mode: str) -> str:
     soup = BeautifulSoup(html_text, "html.parser")
@@ -547,118 +561,84 @@ def send_discord(webhook_url: str, title: str, url: str, selector: Optional[str]
 
 # MonitorWorker with hard-sticky state and stable error signatures
 # MonitorWorker with stable, coarse error kinds (no more spam on getaddrinfo flips)
+#  full class replacement to add missing helpers and heartbeat
 class MonitorWorker(threading.Thread):
-    def __init__(self, monitor: Monitor, state: AppState, alert_queue: "queue.Queue[str]", stop_evt: threading.Event):
+    def __init__(self, monitor: "Monitor", state: "AppState", alert_queue: "queue.Queue[str]", stop_evt: threading.Event):
         super().__init__(daemon=True)
         self.monitor = monitor
         self.state = state
         self.alert_queue = alert_queue
         self.stop_evt = stop_evt
 
-    # ---------- helpers for sticky error signatures ----------
-
-    def _host_from_url(self, url: str) -> str:
-        try:
-            if "://" in url:
-                return url.split("://", 1)[1].split("/", 1)[0]
-            return url.split("/", 1)[0]
-        except Exception:
-            return ""
-
-    def _root_exc(self, e: BaseException) -> BaseException:
-        cur = e
-        seen = set()
-        while True:
-            nxt = getattr(cur, "__cause__", None) or getattr(cur, "__context__", None)
-            if not nxt or nxt in seen:
-                return cur
-            seen.add(nxt)
-            cur = nxt
-
-    def _errno_of(self, e: BaseException) -> Optional[int]:
-        for attr in ("errno", "winerror"):
-            v = getattr(e, attr, None)
-            if isinstance(v, int):
-                return v
-        try:
-            if e.args and isinstance(e.args[0], int):
-                return e.args[0]
-        except Exception:
-            pass
-        return None
-
-    # classify net errors to a coarse, stable kind
-    def _classify_net_error(self, e: BaseException) -> str:
-        import socket
-        try:
-            import urllib3
-            urexc = getattr(urllib3, "exceptions", None)
-        except Exception:
-            urexc = None
-
-        root = self._root_exc(e)
-        name = type(root).__name__.lower()
-
-        # DNS / name resolution
-        if "gaierror" in name or "nameresolutionerror" in name:
-            return "dns"
-        if urexc and isinstance(root, getattr(urexc, "NameResolutionError", tuple())):
-            return "dns"
-
-        # Timeouts (requests/urllib3/socket)
-        if "timeout" in name or "readtimeout" in name or "connecttimeout" in name:
-            return "timeout"
-
-        # TLS/SSL errors
-        if "ssl" in name or "tls" in name or "ssLError".lower() in name:
-            return "tls"
-
-        # Proxy / blocked
-        if "proxy" in name or "blocked" in name:
-            return "proxy"
-
-        # Connection problems (refused/reset)
-        if "connectionerror" in name or "newconnectionerror" in name or "connectionreset" in name or "refused" in name:
-            return "connect"
-
-        # Fallback
-        return "other"
-
-    # build a stable signature using coarse kind + host only
-    def _stable_net_error_signature(self, e: BaseException, url: str) -> str:
-        kind = self._classify_net_error(e)
-        host = self._host_from_url(url)
-        return f"{kind}:{host}"
-
-    def _status_tuple(self, t: Optional[str], code: Optional[str], sig: Optional[str]) -> tuple:
-        return (t or "", code or "", sig or "")
-
-    def _status_changed(self, new_t: Optional[str], new_code: Optional[str], new_sig: Optional[str]) -> bool:
-        return self._status_tuple(new_t, new_code, new_sig) != \
-               self._status_tuple(self.monitor.last_state, self.monitor.last_code, self.monitor.last_sig)
-
-    def _update_status(self, new_t: Optional[str], new_code: Optional[str], new_sig: Optional[str]) -> None:
-        self.monitor.last_state = new_t
-        self.monitor.last_code  = new_code
-        self.monitor.last_sig   = new_sig
-
+    # : label helper used in messages
     def _selector_label(self) -> str:
-        return self.monitor.selector if self.monitor.selector else "(whole page)"
+        if not self.monitor.selector:
+            return "whole page"
+        return f"selector '{self.monitor.selector}' ({self.monitor.mode})"
 
-    # ---------- main loop ----------
+    # : detect if observable status actually changed
+    def _status_changed(self, new_type: str, new_code: Optional[str], new_sig: Optional[str]) -> bool:
+        prev_t = getattr(self.monitor, "last_state", None)
+        prev_c = getattr(self.monitor, "last_status_code", None)
+        prev_s = getattr(self.monitor, "last_error_sig", None)
+        return (new_type != prev_t) or (new_code != prev_c) or (new_sig != prev_s)
+
+    # : write current status back into the monitor object
+    def _update_status(self, new_type: str, new_code: Optional[str], new_sig: Optional[str]) -> None:
+        self.monitor.last_state = new_type
+        self.monitor.last_status_code = new_code
+        self.monitor.last_error_sig = new_sig
+
+    # : normalize network/transport error kinds for stable logging
+    def _classify_net_error(self, exc: Exception) -> str:
+        import socket
+        from requests.exceptions import SSLError, ConnectTimeout, ReadTimeout, Timeout, ConnectionError as ReqConnErr
+        emsg = str(exc).lower()
+
+        if isinstance(exc, (ConnectTimeout, ReadTimeout, Timeout)):
+            return "timeout"
+        if isinstance(exc, SSLError) or "ssl" in emsg:
+            return "tls_error"
+        if isinstance(exc, ReqConnErr):
+            return "connect_error"
+        if isinstance(exc, socket.gaierror) or "dns" in emsg or "name or service not known" in emsg or "getaddrinfo" in emsg:
+            return "dns"
+        if "refused" in emsg or "connection refused" in emsg:
+            return "refused"
+        if "reset" in emsg or "connection reset" in emsg:
+            return "reset"
+        if "proxy" in emsg:
+            return "proxy_error"
+        return "net_error"
+
+    # : make a short signature so repeated identical errors don't spam recoveries
+    def _stable_net_error_signature(self, exc: Exception, url: str) -> str:
+        import traceback
+        tb = "".join(traceback.format_exception_only(type(exc), exc)).strip()
+        core = f"{type(exc).__name__}:{tb}:{url.split('//',1)[-1].split('/',1)[0]}"
+        return hashlib.sha256(core.encode("utf-8", "ignore")).hexdigest()[:16]
 
     def run(self):
         first_run = True
         while not self.stop_evt.is_set():
             start_ts = time.time()
+
+            #  early heartbeat so you can see this monitor is active
+            if self.state.verbose_status:
+                try:
+                    ts = time.strftime("%H:%M:%S")
+                    self.alert_queue.put(f"{CYAN}[{ts}] {self.monitor.url} — checking...{RESET}")
+                except Exception:
+                    pass
+
             try:
-                # fetch
+                # fetch content (JS vs non-JS)
                 if self.monitor.use_js:
                     content = fetch_rendered_content(
                         self.monitor.url,
                         self.monitor.selector,
                         self.monitor.mode,
-                        wait_ms=max(0, int(self.monitor.js_wait_ms)),
+                        wait_ms=max(0, int(getattr(self.monitor, "js_wait_ms", 1500))),
                         polls=3,
                         poll_interval_ms=400,
                     )
@@ -685,7 +665,7 @@ class MonitorWorker(threading.Thread):
                         new_etag = None
                         new_lm = None
 
-                # http error path
+                # --------------------- STATUS: HTTP ERROR ---------------------
                 if not status_ok:
                     ts_footer = time.strftime("%Y-%m-%d %H:%M:%S")
                     new_t, new_code, new_sig = "http_error", str(status_code), None
@@ -701,16 +681,18 @@ class MonitorWorker(threading.Thread):
                     self._update_status(new_t, new_code, new_sig)
                     save_monitor_delta(self.monitor)
 
-                # ok path
+                # ----------------------- STATUS: OK PATH ----------------------
                 else:
+                    # JS path can return None when DOM unstable across quick polls
                     if self.monitor.use_js and content is None:
                         if self.state.verbose_status:
                             ts = time.strftime("%H:%M:%S")
                             self.alert_queue.put(f"{CYAN}[{ts}] {self.monitor.url} — unstable DOM; change ignored.{RESET}")
                         self._update_status("ok", "200", None)
                         save_monitor_delta(self.monitor)
+
                     else:
-                        # one-time recovery alert
+                        # recovery notice (only if previously an access error)
                         if (
                             self.monitor.last_state in ("http_error", "net_error")
                             and self.monitor.last_hash is not None
@@ -725,24 +707,24 @@ class MonitorWorker(threading.Thread):
 
                         self._update_status("ok", "200", None)
 
-                        # no-change (304)
                         if content is None:
                             if self.state.verbose_status:
                                 ts = time.strftime("%H:%M:%S")
                                 self.alert_queue.put(f"{CYAN}[{ts}] {self.monitor.url} — no change (304).{RESET}")
                             save_monitor_delta(self.monitor)
+
                         else:
                             content_str = content or ""
                             is_empty_now = (content_str.strip() == "")
 
-                            # content-only guard (unchanged)
-                            if self.monitor.content_only_changes:
+                            # optional content-only empty->filled transition handling
+                            if getattr(self.monitor, "content_only_changes", False):
                                 if is_empty_now:
                                     self.monitor.was_empty = True
                                     save_monitor_delta(self.monitor)
                                     first_run = False
                                 else:
-                                    if self.monitor.was_empty:
+                                    if getattr(self.monitor, "was_empty", False):
                                         old_excerpt = self.monitor.last_excerpt or ""
                                         d = diff_excerpt(old_excerpt, content_str)
                                         ts_hms = time.strftime("%H:%M:%S")
@@ -767,18 +749,21 @@ class MonitorWorker(threading.Thread):
 
                             new_hash = compute_hash(content_str)
 
+                            # baseline on first successful fetch
                             if first_run and not self.monitor.last_hash:
                                 self.monitor.last_hash = new_hash
                                 self.monitor.last_excerpt = content_str[:2000]
                                 self.monitor.etag = new_etag
                                 self.monitor.last_modified = new_lm
-                                if self.monitor.content_only_changes:
+                                if getattr(self.monitor, "content_only_changes", False):
                                     self.monitor.was_empty = is_empty_now
                                 save_monitor_delta(self.monitor)
                                 if self.state.verbose_status:
                                     self.alert_queue.put(f"{GREEN}[BASELINE] {self.monitor.url} — {self._selector_label()} captured baseline.{RESET}")
+
+                            # content changed
                             elif new_hash != self.monitor.last_hash:
-                                time.sleep(1.0)
+                                time.sleep(1.0)  # debounce quick flaps
                                 content2 = None
                                 try:
                                     if self.monitor.use_js:
@@ -786,7 +771,7 @@ class MonitorWorker(threading.Thread):
                                             self.monitor.url,
                                             self.monitor.selector,
                                             self.monitor.mode,
-                                            wait_ms=max(0, int(self.monitor.js_wait_ms)),
+                                            wait_ms=max(0, int(getattr(self.monitor, "js_wait_ms", 1500))),
                                             polls=2,
                                             poll_interval_ms=350,
                                         )
@@ -798,7 +783,7 @@ class MonitorWorker(threading.Thread):
                                     content2 = None
 
                                 if content2 is not None and compute_hash(content2) == new_hash:
-                                    if self.monitor.content_only_changes and (content2.strip() == ""):
+                                    if getattr(self.monitor, "content_only_changes", False) and (content2.strip() == ""):
                                         self.monitor.was_empty = True
                                         save_monitor_delta(self.monitor)
                                     else:
@@ -811,7 +796,7 @@ class MonitorWorker(threading.Thread):
                                         self.monitor.last_excerpt = content_str[:2000]
                                         self.monitor.etag = new_etag
                                         self.monitor.last_modified = new_lm
-                                        if self.monitor.content_only_changes:
+                                        if getattr(self.monitor, "content_only_changes", False):
                                             self.monitor.was_empty = False
                                         save_monitor_delta(self.monitor)
 
@@ -836,8 +821,8 @@ class MonitorWorker(threading.Thread):
                                 save_monitor_delta(self.monitor)
 
             except Exception as e:
+                # network/transport error path
                 ts_footer = time.strftime("%Y-%m-%d %H:%M:%S")
-                # coarse, stable kind + signature => no repeated alerts for 11001/11002 flips
                 kind = self._classify_net_error(e)
                 sig = self._stable_net_error_signature(e, self.monitor.url)
                 new_t, new_code, new_sig = "net_error", kind, sig
@@ -857,12 +842,11 @@ class MonitorWorker(threading.Thread):
 
             first_run = False
             elapsed = time.time() - start_ts
-            remaining = max(1, self.monitor.interval_sec - int(elapsed))
+            remaining = max(1, int(self.monitor.interval_sec) - int(elapsed))
             for _ in range(remaining):
                 if self.stop_evt.is_set():
                     break
                 time.sleep(1)
-
 
 # ========================
 # UI helpers
