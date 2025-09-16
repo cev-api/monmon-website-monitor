@@ -23,7 +23,7 @@ MonMon is a small Python 3 console app that monitors websites for changes and al
 - Smart selector normalization: Automatically fixes simple class names (`foo bar` → `.foo.bar`).
 - Safe baseline reset: Re-baseline a monitor from the edit menu without triggering a false alert.
 - Stable error categories: DNS, timeout, TLS, proxy, and connection errors are grouped to avoid noisy flip-flopping.
-- Rich-enhanced UI**: If installed, menus and monitor lists are styled; otherwise, plain console mode is used.
+- Rich-enhanced UI: If installed, menus and monitor lists are styled; otherwise, plain console mode is used.
   
 ---
 
