@@ -638,7 +638,7 @@ class MonitorWorker(threading.Thread):
             if self.state.verbose_status:
                 try:
                     ts = time.strftime("%H:%M:%S")
-                    self.alert_queue.put(f"{WHITE}[{ts}] {self.monitor.url} — checking...{RESET}")
+                    self.alert_queue.put(f"{PURPLE}[{ts}]{WHITE} {self.monitor.url} — checking...{RESET}")
                 except Exception:
                     pass
 
@@ -688,7 +688,7 @@ class MonitorWorker(threading.Thread):
                                      msg, footer_text=f"Detected at {ts_footer}")
                     elif self.state.verbose_status:
                         ts = time.strftime("%H:%M:%S")
-                        self.alert_queue.put(f"{WHITE}[{ts}] {self.monitor.url} — still {status_code}.{RESET}")
+                        self.alert_queue.put(f"{PURPLE}[{ts}]{WHITE} {self.monitor.url} — still {status_code}.{RESET}")
                     self._update_status(new_t, new_code, new_sig)
                     save_monitor_delta(self.monitor)
 
@@ -698,7 +698,7 @@ class MonitorWorker(threading.Thread):
                     if self.monitor.use_js and content is None:
                         if self.state.verbose_status:
                             ts = time.strftime("%H:%M:%S")
-                            self.alert_queue.put(f"{WHITE}[{ts}] {self.monitor.url} — unstable DOM; change ignored.{RESET}")
+                            self.alert_queue.put(f"{PURPLE}[{ts}]{WHITE} {self.monitor.url} — unstable DOM; change ignored.{RESET}")
                         self._update_status("ok", "200", None)
                         save_monitor_delta(self.monitor)
 
@@ -721,7 +721,7 @@ class MonitorWorker(threading.Thread):
                         if content is None:
                             if self.state.verbose_status:
                                 ts = time.strftime("%H:%M:%S")
-                                self.alert_queue.put(f"{WHITE}[{ts}] {self.monitor.url} — no change (304).{RESET}")
+                                self.alert_queue.put(f"{PURPLE}[{ts}]{WHITE} {self.monitor.url} — no change (304).{RESET}")
                             save_monitor_delta(self.monitor)
 
                         else:
@@ -823,12 +823,12 @@ class MonitorWorker(threading.Thread):
                                 else:
                                     if self.state.verbose_status:
                                         ts = time.strftime("%H:%M:%S")
-                                        self.alert_queue.put(f"{WHITE}[{ts}] {self.monitor.url} — transient change ignored.{RESET}")
+                                        self.alert_queue.put(f"{PURPLE}[{ts}]{WHITE} {self.monitor.url} — transient change ignored.{RESET}")
                                     save_monitor_delta(self.monitor)
                             else:
                                 if self.state.verbose_status:
                                     ts = time.strftime("%H:%M:%S")
-                                    self.alert_queue.put(f"{WHITE}[{ts}] {self.monitor.url} — checked, no change.{RESET}")
+                                    self.alert_queue.put(f"{PURPLE}[{ts}]{WHITE} {self.monitor.url} — checked, no change.{RESET}")
                                 save_monitor_delta(self.monitor)
 
             except Exception as e:
@@ -846,7 +846,7 @@ class MonitorWorker(threading.Thread):
                                  msg, footer_text=f"Detected at {ts_footer}")
                 elif self.state.verbose_status:
                     ts = time.strftime("%H:%M:%S")
-                    self.alert_queue.put(f"{WHITE}[{ts}] {self.monitor.url} — still unreachable ({kind}).{RESET}")
+                    self.alert_queue.put(f"{PURPLE}[{ts}]{WHITE} {self.monitor.url} — still unreachable ({kind}).{RESET}")
 
                 self._update_status(new_t, new_code, new_sig)  #  persist to correct fields
                 save_monitor_delta(self.monitor)
@@ -1572,7 +1572,7 @@ def start_monitoring(state: AppState) -> None:
             except queue.Empty:
                 pass
     except KeyboardInterrupt:
-        print(f"\n{YELLOW}Stopping...{RESET}")
+        print(f"\n{PURPLE}Stopping...{RESET}")
         stop_evt.set()
         for w in workers:
             w.join(timeout=5.0)
